@@ -204,3 +204,104 @@ def chunk_corpus(
         f"(avg {len(result)/max(len(corpus_df),1):.1f} chunks/doc)"
     )
     return result
+
+
+def chunk_parquet_streaming(
+    input_paths: list[tuple[Path, str]],
+    output_path: Path,
+    text_column: str = "text",
+    max_tokens: int = 480,
+    overlap_tokens: int = 64,
+    batch_size: int = 10_000,
+) -> int:
+    """Chunk multiple parquet files in batches without loading all into RAM.
+
+    Reads each parquet file in batches, chunks each batch, and appends
+    results to the output parquet file incrementally.
+
+    Args:
+        input_paths: List of (parquet_path, source_name) tuples.
+        output_path: Output parquet file for all chunks.
+        text_column: Name of the text column.
+        max_tokens: Max tokens per chunk.
+        overlap_tokens: Overlap between chunks.
+        batch_size: Rows to process at a time.
+
+    Returns:
+        Total number of chunks created.
+    """
+    import pyarrow.parquet as pq
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    total_chunks = 0
+    writer = None
+
+    for parquet_path, source_name in input_paths:
+        parquet_path = Path(parquet_path)
+        if not parquet_path.exists():
+            logger.warning(f"Skipping {parquet_path} — file not found")
+            continue
+
+        pf = pq.ParquetFile(parquet_path)
+        n_rows = pf.metadata.num_rows
+        logger.info(f"Processing {source_name}: {n_rows:,} rows in batches of {batch_size}")
+
+        doc_offset = total_chunks
+        batch_num = 0
+
+        for batch in tqdm(
+            pf.iter_batches(batch_size=batch_size, columns=[text_column] if text_column in pf.schema.names else None),
+            total=(n_rows + batch_size - 1) // batch_size,
+            desc=f"Chunking {source_name}",
+        ):
+            batch_df = batch.to_pandas()
+            if text_column not in batch_df.columns:
+                # Try to find a text-like column
+                str_cols = batch_df.select_dtypes(include="object").columns
+                if len(str_cols) > 0:
+                    text_column_actual = str_cols[0]
+                else:
+                    continue
+            else:
+                text_column_actual = text_column
+
+            chunk_rows = []
+            for i, row in batch_df.iterrows():
+                text = row.get(text_column_actual, "")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+
+                doc_id = f"{source_name}_{doc_offset + batch_num * batch_size + i}"
+                chunks = legal_aware_chunk(
+                    text=text,
+                    metadata={"_source": source_name},
+                    parent_doc_id=doc_id,
+                    max_tokens=max_tokens,
+                    overlap_tokens=overlap_tokens,
+                )
+                for c in chunks:
+                    chunk_rows.append({
+                        "chunk_id": c.chunk_id,
+                        "parent_doc_id": c.parent_doc_id,
+                        "text": c.text,
+                        "_source": source_name,
+                    })
+
+            if chunk_rows:
+                import pyarrow as pa
+                chunk_table = pa.Table.from_pylist(chunk_rows)
+                if writer is None:
+                    writer = pq.ParquetWriter(str(output_path), chunk_table.schema)
+                writer.write_table(chunk_table)
+                total_chunks += len(chunk_rows)
+
+            batch_num += 1
+            del batch_df, chunk_rows
+            import gc; gc.collect()
+
+    if writer:
+        writer.close()
+
+    logger.info(f"Total chunks created: {total_chunks:,}")
+    return total_chunks
