@@ -1,0 +1,89 @@
+datasets:
+  huggingface:
+    - id: "erdem-erdem/Turkish-Law-Documents-700k-clustered"
+      name: "yargitay_700k"
+      use: "corpus"
+    - id: "OrionCAF/turkish_law_qa_dataset"
+      name: "turkish_law_qa"
+      use: "qa"
+    - id: "Renicames/turkish-law-chatbot"
+      name: "turkish_law_chatbot"
+      use: "qa"
+  kaggle:
+    - slug: "batuhankalem/turkishlaw-dataset-for-llm-finetuning"
+      name: "kaggle_turkish_law"
+      use: "corpus"
+
+chunking:
+  max_tokens: 480
+  overlap_tokens: 64
+  legal_split_pattern: 'Madde\s+\d+'
+  section_split_pattern: '(?:BÖLÜM|KISIM|FASIL)\s+'
+
+models:
+  embedding: "intfloat/multilingual-e5-large"
+  embedding_alt: "msbayindir/legal-text-embedding-turkish-v1"
+  colbert: "colbert-ir/colbertv2.0"
+  reranker: "seroe/bge-reranker-v2-m3-turkish-triplet"
+  llm: "Qwen/Qwen2.5-7B-Instruct"
+  nli: "emrecan/bert-base-turkish-cased-mean-nli-stsb-tr"
+
+retrieval:
+  faiss:
+    nlist: 256
+    m: 32
+    nbits: 8
+    nprobe: 16
+  bm25:
+    k1: 1.5
+    b: 0.75
+  fusion:
+    rrf_k: 60
+  dense_top_k: 50
+  bm25_top_k: 50
+  final_top_k: 10
+
+generation:
+  max_new_tokens: 512
+  temperature: 0.1
+  top_p: 0.9
+
+qlora:
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  learning_rate: 3.0e-5
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  num_epochs: 2
+  max_seq_length: 4096
+  warmup_ratio: 0.1
+  checkpoint_steps: 500
+
+evaluation:
+  bootstrap_n: 1000
+  bootstrap_alpha: 0.05
+  gold_set_path: "data/gold/gold_test_set.json"
+
+paths:
+  drive_root: "/content/drive/MyDrive/hukuk-rag"
+  corpus_parquet: "data/processed/corpus.parquet"
+  chunks_parquet: "data/processed/chunks.parquet"
+  faiss_index: "indexes/faiss.index"
+  bm25_index: "indexes/bm25.pkl"
+  chunk_mapping: "indexes/chunk_mapping.pkl"
+
+seeds:
+  torch: 42
+  numpy: 42
+  random: 42
