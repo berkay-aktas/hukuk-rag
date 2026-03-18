@@ -1,0 +1,45 @@
+{
+  "description": "Gold test set template - 5 example questions (one per domain). Expand to 200+ standard and 50+ adversarial questions.",
+  "questions": [
+    {
+      "question": "Kasten adam öldürme suçunun cezası nedir?",
+      "gold_answer": "TCK Madde 81'e göre, bir insanı kasten öldüren kişi, müebbet hapis cezası ile cezalandırılır.",
+      "relevant_doc_ids": [],
+      "domain": "criminal",
+      "difficulty": "easy",
+      "is_answerable": true
+    },
+    {
+      "question": "Kira sözleşmesinde kiracının hakları nelerdir?",
+      "gold_answer": "6098 sayılı Türk Borçlar Kanunu'na göre kiracı, kira sözleşmesi süresince kiralananı sözleşmeye uygun olarak kullanma hakkına sahiptir.",
+      "relevant_doc_ids": [],
+      "domain": "civil",
+      "difficulty": "medium",
+      "is_answerable": true
+    },
+    {
+      "question": "Anonim şirketlerde yönetim kurulu üyelerinin sorumluluğu nasıl belirlenir?",
+      "gold_answer": "6102 sayılı Türk Ticaret Kanunu Madde 553'e göre, yönetim kurulu üyeleri kanundan ve esas sözleşmeden doğan yükümlülüklerini kusurlarıyla ihlal ettikleri takdirde şirkete, pay sahiplerine ve alacaklılara karşı sorumludur.",
+      "relevant_doc_ids": [],
+      "domain": "commercial",
+      "difficulty": "hard",
+      "is_answerable": true
+    },
+    {
+      "question": "İdari yargıda dava açma süresi ne kadardır?",
+      "gold_answer": "2577 sayılı İdari Yargılama Usulü Kanunu'na göre, iptal davaları için dava açma süresi yazılı bildirimin yapıldığı tarihi izleyen günden itibaren 60 gündür.",
+      "relevant_doc_ids": [],
+      "domain": "administrative",
+      "difficulty": "easy",
+      "is_answerable": true
+    },
+    {
+      "question": "9999 sayılı Kanun'un 42. maddesi ne düzenlemektedir?",
+      "gold_answer": "Bu soruya yanıt verilemez. 9999 sayılı bir kanun bulunmamaktadır.",
+      "relevant_doc_ids": [],
+      "domain": "constitutional",
+      "difficulty": "hard",
+      "is_answerable": false
+    }
+  ]
+}
