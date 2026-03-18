@@ -1,0 +1,56 @@
+# Claude
+CLAUDE.md
+
+# Data
+data/raw/
+data/processed/
+*.parquet
+*.pkl
+*.pickle
+
+# Model artifacts
+*.pt
+*.bin
+*.safetensors
+*.gguf
+checkpoints/
+models/
+
+# FAISS indexes
+*.index
+*.faiss
+
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Colab
+.config/
+sample_data/
+
+# Audio/media (professor recordings etc)
+*.mp4
+*.mp3
+*.wav
+
+# Whisper model cache
+*.pt
+
+# Misc
+*.log
+.cache/
