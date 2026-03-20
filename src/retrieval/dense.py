@@ -1,24 +1,27 @@
-"""Dense retrieval with FAISS and sentence-transformers."""
+"""Dense retrieval with FAISS and sentence-transformers.
+
+Encodes chunks using multilingual-e5-large (or a fine-tuned variant) and
+indexes them with FAISS IVF-PQ for approximate nearest-neighbour search.
+Queries are prefixed with ``"query: "`` and passages with ``"passage: "``
+as required by the E5 model family.
+"""
+
+from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from tqdm import tqdm
+
+from src.retrieval.types import RetrievalResult
+
+if TYPE_CHECKING:
+    import faiss
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class RetrievalResult:
-    """A single retrieval result."""
-    chunk_id: str
-    score: float
-    text: str
-    metadata: dict[str, Any]
 
 
 def build_faiss_index(
@@ -29,7 +32,8 @@ def build_faiss_index(
     nlist: int = 256,
     m: int = 32,
     nbits: int = 8,
-) -> tuple[Any, list[dict[str, Any]]]:
+    seed: int = 42,
+) -> tuple[faiss.Index, list[dict[str, Any]]]:
     """Build a FAISS IVF-PQ index from chunks.
 
     Args:
@@ -38,13 +42,14 @@ def build_faiss_index(
         save_path: Optional path to save index and mapping.
         batch_size: Batch size for encoding.
         nlist: Number of Voronoi cells for IVF.
-        m: Number of subquantizers for PQ.
-        nbits: Bits per subquantizer.
+        m: Number of sub-quantizers for PQ.
+        nbits: Bits per sub-quantizer.
+        seed: Random seed for reproducible IVF training sample.
 
     Returns:
         Tuple of (FAISS index, chunk mapping list).
     """
-    import faiss
+    import faiss as _faiss
     from sentence_transformers import SentenceTransformer
 
     logger.info(f"Loading embedding model: {model_name}")
@@ -64,25 +69,23 @@ def build_faiss_index(
     dim = embeddings.shape[1]
     logger.info(f"Building FAISS IVF-PQ index (dim={dim}, nlist={nlist}, m={m})...")
 
-    quantizer = faiss.IndexFlatIP(dim)
-    index = faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits)
+    quantizer = _faiss.IndexFlatIP(dim)
+    index = _faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits)
 
+    rng = np.random.RandomState(seed)
     train_size = min(len(embeddings), nlist * 40)
-    train_indices = np.random.choice(len(embeddings), train_size, replace=False)
+    train_indices = rng.choice(len(embeddings), train_size, replace=False)
     index.train(embeddings[train_indices])
 
     index.add(embeddings)
     logger.info(f"Index built: {index.ntotal} vectors")
 
-    chunk_mapping = [
-        {"chunk_id": c["chunk_id"], "text": c["text"], **{k: v for k, v in c.items() if k not in ("chunk_id", "text")}}
-        for c in chunks
-    ]
+    chunk_mapping = _build_chunk_mapping(chunks)
 
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(index, str(save_path))
+        _faiss.write_index(index, str(save_path))
         mapping_path = save_path.with_suffix(".mapping.pkl")
         with open(mapping_path, "wb") as f:
             pickle.dump(chunk_mapping, f)
@@ -96,7 +99,7 @@ def build_faiss_index(
 
 def load_faiss_index(
     index_path: Path,
-) -> tuple[Any, list[dict[str, Any]]]:
+) -> tuple[faiss.Index, list[dict[str, Any]]]:
     """Load a FAISS index and chunk mapping from disk.
 
     Args:
@@ -105,13 +108,13 @@ def load_faiss_index(
     Returns:
         Tuple of (FAISS index, chunk mapping list).
     """
-    import faiss
+    import faiss as _faiss
 
     index_path = Path(index_path)
-    index = faiss.read_index(str(index_path))
+    index = _faiss.read_index(str(index_path))
     mapping_path = index_path.with_suffix(".mapping.pkl")
     with open(mapping_path, "rb") as f:
-        chunk_mapping = pickle.load(f)
+        chunk_mapping = pickle.load(f)  # noqa: S301
 
     logger.info(f"Loaded index ({index.ntotal} vectors) from {index_path}")
     return index, chunk_mapping
@@ -119,9 +122,9 @@ def load_faiss_index(
 
 def dense_search(
     query: str,
-    index: Any,
+    index: faiss.Index,
     chunk_mapping: list[dict[str, Any]],
-    model: Any,
+    model: SentenceTransformer,
     k: int = 50,
     nprobe: int = 16,
 ) -> list[RetrievalResult]:
@@ -156,23 +159,32 @@ def dense_search(
             chunk_id=chunk["chunk_id"],
             score=float(score),
             text=chunk["text"],
-            metadata={k: v for k, v in chunk.items() if k not in ("chunk_id", "text")},
+            metadata={key: val for key, val in chunk.items() if key not in ("chunk_id", "text")},
         ))
 
     return results
 
 
-def load_embedding_model(model_name: str = "intfloat/multilingual-e5-large") -> Any:
+def load_embedding_model(model_name: str = "intfloat/multilingual-e5-large") -> SentenceTransformer:
     """Load a sentence-transformer model.
 
     Args:
-        model_name: HuggingFace model identifier.
+        model_name: HuggingFace model identifier or local path.
 
     Returns:
         SentenceTransformer model instance.
     """
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer(model_name)
+
+
+def _build_chunk_mapping(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a chunk mapping list from raw chunk dicts."""
+    return [
+        {"chunk_id": c["chunk_id"], "text": c["text"],
+         **{key: val for key, val in c.items() if key not in ("chunk_id", "text")}}
+        for c in chunks
+    ]
 
 
 def _free_memory() -> None:
