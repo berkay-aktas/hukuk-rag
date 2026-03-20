@@ -147,7 +147,7 @@ def _find_text_column(df: pd.DataFrame, preferred: str) -> str | None:
 
     str_cols = df.select_dtypes(include="object").columns
     if len(str_cols) > 0:
-        longest = max(str_cols, key=lambda c: df[c].str.len().mean())
+        longest = max(str_cols, key=lambda c: df[c].str.len().mean(skipna=True))
         return longest
 
     return None
