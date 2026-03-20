@@ -1,5 +1,6 @@
 """Legal-aware document chunking for Turkish legal texts."""
 
+import gc
 import logging
 import re
 import uuid
@@ -218,14 +219,17 @@ def chunk_parquet_streaming(
     """Chunk multiple parquet files in batches without loading all into RAM.
 
     Reads each parquet file in batches, chunks each batch, and appends
-    results to the output parquet file incrementally.
+    results to the output parquet file incrementally. Peak memory usage
+    is bounded by ``batch_size`` rows regardless of total corpus size.
 
     Args:
         input_paths: List of (parquet_path, source_name) tuples.
         output_path: Output parquet file for all chunks.
-        text_column: Name of the text column.
-        max_tokens: Max tokens per chunk.
-        overlap_tokens: Overlap between chunks.
+        text_column: Name of the text column (auto-detected if missing).
+        max_tokens: Maximum tokens per chunk. Defaults to 480 to stay
+            within multilingual-e5-large's 512-token limit after the
+            ``"passage: "`` prefix and special tokens (~5-10 overhead).
+        overlap_tokens: Token overlap between consecutive chunks.
         batch_size: Rows to process at a time.
 
     Returns:
@@ -252,7 +256,7 @@ def chunk_parquet_streaming(
         batch_num = 0
 
         for batch in tqdm(
-            pf.iter_batches(batch_size=batch_size, columns=[text_column] if text_column in pf.schema.names else None),
+            pf.iter_batches(batch_size=batch_size),
             total=(n_rows + batch_size - 1) // batch_size,
             desc=f"Chunking {source_name}",
         ):
@@ -299,7 +303,7 @@ def chunk_parquet_streaming(
 
             batch_num += 1
             del batch_df, chunk_rows
-            import gc; gc.collect()
+            gc.collect()
 
     if writer:
         writer.close()
