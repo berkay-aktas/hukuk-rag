@@ -1,7 +1,8 @@
-# Claude
+# Claude Code
 CLAUDE.md
+.mcp.json
 
-# Data
+# Data artifacts
 data/raw/
 data/processed/
 *.parquet
@@ -43,13 +44,16 @@ desktop.ini
 .config/
 sample_data/
 
-# Audio/media (professor recordings etc)
+# Media (professor recordings, transcriptions)
 *.mp4
 *.mp3
 *.wav
 
-# Whisper model cache
-*.pt
+# Assignment PDF
+*.pdf
+
+# Transcriptions
+professor_audio_transcription.txt
 
 # Misc
 *.log
