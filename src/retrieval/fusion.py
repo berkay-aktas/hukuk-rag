@@ -1,33 +1,36 @@
-"""Reciprocal Rank Fusion for combining retrieval results."""
+"""Reciprocal Rank Fusion (RRF) for combining retrieval results.
+
+Implements the method from Cormack, Clarke & Buettcher (2009):
+``score(d) = Σ 1 / (k + rank_i(d))`` across all input rankings.
+"""
+
+from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any
+
+from src.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
 
 
 def rrf_merge(
-    *result_lists: list,
+    *result_lists: list[RetrievalResult],
     k: int = 60,
     top_k: int | None = None,
-) -> list:
+) -> list[RetrievalResult]:
     """Merge multiple ranked result lists using Reciprocal Rank Fusion.
-
-    RRF score = sum(1 / (k + rank)) across all lists where the document appears.
 
     Args:
         *result_lists: Variable number of RetrievalResult lists.
         k: RRF constant (default 60, as per original paper).
-        top_k: Optional limit on returned results.
+        top_k: Optional limit on returned results. None returns all.
 
     Returns:
         Merged and re-ranked list of RetrievalResult.
     """
-    from src.retrieval.dense import RetrievalResult
-
     scores: dict[str, float] = defaultdict(float)
-    best_result: dict[str, Any] = {}
+    best_result: dict[str, RetrievalResult] = {}
 
     for results in result_lists:
         for rank, result in enumerate(results):
@@ -39,17 +42,15 @@ def rrf_merge(
 
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
 
-    if top_k:
+    if top_k is not None:
         sorted_ids = sorted_ids[:top_k]
 
-    merged = []
-    for chunk_id in sorted_ids:
-        original = best_result[chunk_id]
-        merged.append(RetrievalResult(
+    return [
+        RetrievalResult(
             chunk_id=chunk_id,
             score=scores[chunk_id],
-            text=original.text,
-            metadata=original.metadata,
-        ))
-
-    return merged
+            text=best_result[chunk_id].text,
+            metadata=best_result[chunk_id].metadata,
+        )
+        for chunk_id in sorted_ids
+    ]
