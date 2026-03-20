@@ -1,53 +1,33 @@
 """BM25 sparse retrieval with Turkish language support."""
 
+from __future__ import annotations
+
 import logging
 import pickle
-import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from src.retrieval.types import RetrievalResult
+from src.utils.turkish import turkish_tokenize
+
+if TYPE_CHECKING:
+    from rank_bm25 import BM25Okapi
 
 logger = logging.getLogger(__name__)
-
-TURKISH_STOPWORDS = {
-    "bir", "bu", "da", "de", "ve", "ile", "için", "olan", "olarak", "gibi",
-    "daha", "en", "çok", "her", "kadar", "sonra", "önce", "ise", "ya",
-    "ne", "nasıl", "neden", "nerede", "kim", "hangi", "o", "şu", "ben",
-    "sen", "biz", "siz", "onlar", "mi", "mu", "mü", "mı", "dir", "dır",
-    "dur", "dür", "tir", "tır", "tur", "tür", "ki", "ama", "ancak",
-    "fakat", "lakin", "veya", "yahut", "hem", "üzere", "göre", "karşı",
-    "arasında", "tarafından", "dolayı", "halde", "rağmen", "itibaren",
-    "değil", "var", "yok", "olan", "eden", "eder", "etti", "oldu",
-    "olur", "olmuş", "olan", "olan", "iken", "olup", "buna", "şöyle",
-    "böyle", "öyle", "aynı", "bazı", "birçok", "diğer", "başka",
-}
-
-TURKISH_LOWER_MAP = str.maketrans("İIÖÜÇŞĞ", "iıöüçşğ")
-
-
-def turkish_tokenize(text: str) -> list[str]:
-    """Tokenize Turkish text with proper lowercasing and stopword removal.
-
-    Args:
-        text: Input text.
-
-    Returns:
-        List of tokens.
-    """
-    text = text.translate(TURKISH_LOWER_MAP).lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    tokens = text.split()
-    return [t for t in tokens if t not in TURKISH_STOPWORDS and len(t) > 1]
 
 
 def build_bm25_index(
     chunks: list[dict[str, Any]],
     save_path: Path | None = None,
-) -> tuple[Any, list[dict[str, Any]]]:
+) -> tuple[BM25Okapi, list[dict[str, Any]]]:
     """Build a BM25 index from chunks.
+
+    Uses Turkish-aware tokenization with proper locale lowercasing
+    (İ→i, I→ı) and stopword removal.
 
     Args:
         chunks: List of chunk dicts with 'text' and 'chunk_id' keys.
-        save_path: Optional path to save index.
+        save_path: Optional path to save index as pickle.
 
     Returns:
         Tuple of (BM25Okapi index, chunk mapping list).
@@ -60,7 +40,8 @@ def build_bm25_index(
     index = BM25Okapi(tokenized)
 
     chunk_mapping = [
-        {"chunk_id": c["chunk_id"], "text": c["text"], **{k: v for k, v in c.items() if k not in ("chunk_id", "text")}}
+        {"chunk_id": c["chunk_id"], "text": c["text"],
+         **{key: val for key, val in c.items() if key not in ("chunk_id", "text")}}
         for c in chunks
     ]
 
@@ -74,7 +55,7 @@ def build_bm25_index(
     return index, chunk_mapping
 
 
-def load_bm25_index(path: Path) -> tuple[Any, list[dict[str, Any]]]:
+def load_bm25_index(path: Path) -> tuple[BM25Okapi, list[dict[str, Any]]]:
     """Load a BM25 index from disk.
 
     Args:
@@ -84,18 +65,18 @@ def load_bm25_index(path: Path) -> tuple[Any, list[dict[str, Any]]]:
         Tuple of (BM25Okapi index, chunk mapping list).
     """
     with open(path, "rb") as f:
-        data = pickle.load(f)
+        data = pickle.load(f)  # noqa: S301
     logger.info(f"Loaded BM25 index ({len(data['mapping'])} chunks)")
     return data["index"], data["mapping"]
 
 
 def bm25_search(
     query: str,
-    index: Any,
+    index: BM25Okapi,
     chunk_mapping: list[dict[str, Any]],
     k: int = 50,
-) -> list:
-    """Search BM25 index.
+) -> list[RetrievalResult]:
+    """Search BM25 index with Turkish-tokenized query.
 
     Args:
         query: Query string.
@@ -106,12 +87,12 @@ def bm25_search(
     Returns:
         List of RetrievalResult sorted by score descending.
     """
-    from src.retrieval.dense import RetrievalResult
+    import numpy as np
 
     tokens = turkish_tokenize(query)
     scores = index.get_scores(tokens)
 
-    top_indices = scores.argsort()[-k:][::-1]
+    top_indices = np.argsort(scores)[-k:][::-1]
 
     results = []
     for idx in top_indices:
@@ -122,7 +103,7 @@ def bm25_search(
             chunk_id=chunk["chunk_id"],
             score=float(scores[idx]),
             text=chunk["text"],
-            metadata={k_: v for k_, v in chunk.items() if k_ not in ("chunk_id", "text")},
+            metadata={key: val for key, val in chunk.items() if key not in ("chunk_id", "text")},
         ))
 
     return results
