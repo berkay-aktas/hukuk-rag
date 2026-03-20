@@ -1,19 +1,33 @@
-"""Evaluation metrics for retrieval and generation quality."""
+"""Evaluation metrics for retrieval and generation quality.
+
+Retrieval: Recall@K, MRR, nDCG@K (binary relevance).
+Generation: Exact Match, Token F1 (SQuAD-style), ROUGE-L.
+Statistical testing: percentile bootstrap CIs, Wilcoxon signed-rank.
+"""
+
+from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections import Counter
+from typing import Callable
 
 import numpy as np
 
+from src.utils.turkish import normalize_turkish
+
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Retrieval metrics
+# ---------------------------------------------------------------------------
 
 def recall_at_k(
     retrieved_ids: list[list[str]],
     relevant_ids: list[list[str]],
     k: int,
 ) -> float:
-    """Compute Recall@K across queries.
+    """Compute mean Recall@K across queries.
 
     Args:
         retrieved_ids: List of retrieved chunk ID lists per query.
@@ -30,7 +44,7 @@ def recall_at_k(
         top_k = set(retrieved[:k])
         rel_set = set(relevant)
         scores.append(len(top_k & rel_set) / len(rel_set))
-    return np.mean(scores) if scores else 0.0
+    return float(np.mean(scores)) if scores else 0.0
 
 
 def mrr(
@@ -55,7 +69,7 @@ def mrr(
                 rr = 1.0 / rank
                 break
         rr_scores.append(rr)
-    return np.mean(rr_scores) if rr_scores else 0.0
+    return float(np.mean(rr_scores)) if rr_scores else 0.0
 
 
 def ndcg_at_k(
@@ -63,7 +77,10 @@ def ndcg_at_k(
     relevant_ids: list[list[str]],
     k: int = 10,
 ) -> float:
-    """Compute nDCG@K.
+    """Compute mean nDCG@K with binary relevance.
+
+    Uses binary relevance (1 if in relevant set, 0 otherwise). For graded
+    relevance, a separate implementation would be needed.
 
     Args:
         retrieved_ids: List of retrieved chunk ID lists per query.
@@ -84,7 +101,7 @@ def ndcg_at_k(
         ideal_hits = min(len(rel_set), k)
         idcg = sum(1.0 / np.log2(rank + 2) for rank in range(ideal_hits))
         ndcg_scores.append(dcg / idcg if idcg > 0 else 0.0)
-    return np.mean(ndcg_scores) if ndcg_scores else 0.0
+    return float(np.mean(ndcg_scores)) if ndcg_scores else 0.0
 
 
 def retrieval_metrics(
@@ -108,8 +125,12 @@ def retrieval_metrics(
     }
 
 
+# ---------------------------------------------------------------------------
+# Generation metrics
+# ---------------------------------------------------------------------------
+
 def exact_match(predictions: list[str], references: list[str]) -> float:
-    """Compute Exact Match score.
+    """Compute Exact Match score after Turkish normalization.
 
     Args:
         predictions: List of predicted answers.
@@ -120,13 +141,16 @@ def exact_match(predictions: list[str], references: list[str]) -> float:
     """
     matches = sum(
         1 for p, r in zip(predictions, references)
-        if _normalize_turkish(p) == _normalize_turkish(r)
+        if normalize_turkish(p) == normalize_turkish(r)
     )
     return matches / len(predictions) if predictions else 0.0
 
 
 def token_f1(predictions: list[str], references: list[str]) -> float:
-    """Compute token-level F1 score.
+    """Compute SQuAD-style token-level F1 score.
+
+    Uses multiset (Counter) overlap rather than set overlap so that
+    duplicate tokens are counted correctly.
 
     Args:
         predictions: List of predicted answers.
@@ -137,24 +161,24 @@ def token_f1(predictions: list[str], references: list[str]) -> float:
     """
     f1_scores = []
     for pred, ref in zip(predictions, references):
-        pred_tokens = set(_normalize_turkish(pred).split())
-        ref_tokens = set(_normalize_turkish(ref).split())
+        pred_tokens = Counter(normalize_turkish(pred).split())
+        ref_tokens = Counter(normalize_turkish(ref).split())
 
         if not pred_tokens or not ref_tokens:
             f1_scores.append(0.0)
             continue
 
-        common = pred_tokens & ref_tokens
-        if not common:
+        common = sum((pred_tokens & ref_tokens).values())
+        if common == 0:
             f1_scores.append(0.0)
             continue
 
-        precision = len(common) / len(pred_tokens)
-        recall = len(common) / len(ref_tokens)
+        precision = common / sum(pred_tokens.values())
+        recall = common / sum(ref_tokens.values())
         f1 = 2 * precision * recall / (precision + recall)
         f1_scores.append(f1)
 
-    return np.mean(f1_scores) if f1_scores else 0.0
+    return float(np.mean(f1_scores)) if f1_scores else 0.0
 
 
 def generation_metrics(
@@ -168,7 +192,7 @@ def generation_metrics(
         references: List of reference answers.
 
     Returns:
-        Dict with EM, F1, ROUGE-L.
+        Dict with EM, token F1, and ROUGE-L.
     """
     metrics = {
         "exact_match": exact_match(predictions, references),
@@ -179,15 +203,19 @@ def generation_metrics(
         from rouge_score import rouge_scorer
         scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
         rouge_scores = [
-            scorer.score(_normalize_turkish(ref), _normalize_turkish(pred))["rougeL"].fmeasure
+            scorer.score(normalize_turkish(ref), normalize_turkish(pred))["rougeL"].fmeasure
             for pred, ref in zip(predictions, references)
         ]
-        metrics["rouge_l"] = np.mean(rouge_scores)
+        metrics["rouge_l"] = float(np.mean(rouge_scores))
     except ImportError:
         logger.warning("rouge_score not installed, skipping ROUGE-L")
 
     return metrics
 
+
+# ---------------------------------------------------------------------------
+# Statistical testing
+# ---------------------------------------------------------------------------
 
 def bootstrap_ci(
     metric_fn: Callable,
@@ -195,25 +223,30 @@ def bootstrap_ci(
     references: list,
     n: int = 1000,
     alpha: float = 0.05,
+    seed: int = 42,
 ) -> dict[str, float]:
-    """Compute bootstrap confidence intervals for a metric.
+    """Compute percentile bootstrap confidence intervals for a metric.
+
+    Uses the percentile method (not BCa). For small or skewed samples
+    the coverage may be approximate.
 
     Args:
         metric_fn: Function(predictions, references) -> float.
         predictions: List of predictions.
         references: List of references.
-        n: Number of bootstrap samples.
+        n: Number of bootstrap resamples.
         alpha: Significance level (default 0.05 for 95% CI).
+        seed: Random seed for reproducibility.
 
     Returns:
         Dict with mean, lower, upper.
     """
-    rng = np.random.RandomState(42)
+    rng = np.random.default_rng(seed)
     size = len(predictions)
     scores = []
 
     for _ in range(n):
-        indices = rng.randint(0, size, size)
+        indices = rng.integers(0, size, size=size)
         boot_preds = [predictions[i] for i in indices]
         boot_refs = [references[i] for i in indices]
         scores.append(metric_fn(boot_preds, boot_refs))
@@ -223,9 +256,9 @@ def bootstrap_ci(
     upper = scores[int(n * (1 - alpha / 2))]
 
     return {
-        "mean": np.mean(scores),
-        "lower": lower,
-        "upper": upper,
+        "mean": float(np.mean(scores)),
+        "lower": float(lower),
+        "upper": float(upper),
     }
 
 
@@ -234,6 +267,10 @@ def paired_significance_test(
     scores_b: list[float],
 ) -> dict[str, float]:
     """Wilcoxon signed-rank test between two systems.
+
+    Assumes the distribution of pairwise differences is symmetric.
+    For bounded or zero-inflated IR metrics this assumption may be
+    violated; consider a permutation test as an alternative.
 
     Args:
         scores_a: Per-query scores for system A.
@@ -250,22 +287,3 @@ def paired_significance_test(
 
     stat, p = wilcoxon(scores_a, scores_b)
     return {"statistic": float(stat), "p_value": float(p)}
-
-
-TURKISH_LOWER_MAP = str.maketrans("İIÖÜÇŞĞ", "iıöüçşğ")
-
-
-def _normalize_turkish(text: str) -> str:
-    """Normalize Turkish text for comparison.
-
-    Args:
-        text: Input text.
-
-    Returns:
-        Normalized text.
-    """
-    import re
-    text = text.translate(TURKISH_LOWER_MAP).lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
