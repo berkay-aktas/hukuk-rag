@@ -83,7 +83,6 @@ A domain-adapted Retrieval-Augmented Generation system for Turkish legal questio
 │   └── config.yaml         # Hyperparameters, model identifiers, paths
 ├── data/
 │   └── gold/               # Held-out evaluation set (never trained on)
-├── PROJECT_PLAN.md         # Implementation roadmap and ablation configs
 └── requirements.txt
 ```
 
