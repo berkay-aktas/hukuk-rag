@@ -1,13 +1,16 @@
 """Evaluation metrics for retrieval and generation quality.
 
 Retrieval: Recall@K, MRR, nDCG@K (binary relevance).
-Generation: Exact Match, Token F1 (SQuAD-style), ROUGE-L.
+Generation: Exact Match, Token F1 (SQuAD-style), ROUGE-L, BLEU.
+Faithfulness: token overlap between answer and retrieved context.
+Citation: accuracy of [Kaynak N] references in generated answers.
 Statistical testing: percentile bootstrap CIs, Wilcoxon signed-rank.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from typing import Callable
 
@@ -181,6 +184,63 @@ def token_f1(predictions: list[str], references: list[str]) -> float:
     return float(np.mean(f1_scores)) if f1_scores else 0.0
 
 
+def bleu_score(predictions: list[str], references: list[str]) -> float:
+    """Compute corpus-level BLEU score with Turkish normalization.
+
+    Uses whitespace tokenization, which is appropriate for Turkish
+    agglutinative morphology (avoids inflated scores from subword methods).
+
+    Args:
+        predictions: List of predicted answers.
+        references: List of reference answers.
+
+    Returns:
+        Corpus BLEU score (0-1).
+    """
+    from collections import Counter
+
+    def ngrams(tokens: list[str], n: int) -> Counter:
+        return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1))
+
+    total_bp_c = 0
+    total_bp_r = 0
+    clipped_counts = [0, 0, 0, 0]
+    total_counts = [0, 0, 0, 0]
+
+    for pred, ref in zip(predictions, references):
+        pred_tokens = normalize_turkish(pred).split()
+        ref_tokens = normalize_turkish(ref).split()
+
+        if not pred_tokens:
+            continue
+
+        total_bp_c += len(pred_tokens)
+        total_bp_r += len(ref_tokens)
+
+        for n in range(1, 5):
+            pred_ng = ngrams(pred_tokens, n)
+            ref_ng = ngrams(ref_tokens, n)
+            clipped = sum((pred_ng & ref_ng).values())
+            total = sum(pred_ng.values())
+            clipped_counts[n-1] += clipped
+            total_counts[n-1] += total
+
+    # Brevity penalty
+    if total_bp_c == 0:
+        return 0.0
+    bp = min(1.0, np.exp(1 - total_bp_r / total_bp_c))
+
+    # Geometric mean of n-gram precisions
+    precisions = []
+    for n in range(4):
+        if total_counts[n] == 0:
+            return 0.0
+        precisions.append(clipped_counts[n] / total_counts[n])
+
+    log_avg = sum(np.log(p + 1e-10) for p in precisions) / 4
+    return float(bp * np.exp(log_avg))
+
+
 def generation_metrics(
     predictions: list[str],
     references: list[str],
@@ -192,11 +252,12 @@ def generation_metrics(
         references: List of reference answers.
 
     Returns:
-        Dict with EM, token F1, and ROUGE-L.
+        Dict with EM, token F1, ROUGE-L, and BLEU.
     """
     metrics = {
         "exact_match": exact_match(predictions, references),
         "token_f1": token_f1(predictions, references),
+        "bleu": bleu_score(predictions, references),
     }
 
     try:
@@ -211,6 +272,80 @@ def generation_metrics(
         logger.warning("rouge_score not installed, skipping ROUGE-L")
 
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Faithfulness and citation metrics
+# ---------------------------------------------------------------------------
+
+_CITATION_PATTERN = re.compile(r'\[(\d+)\]')
+
+
+def faithfulness_score(
+    predictions: list[str],
+    contexts: list[str],
+) -> float:
+    """Compute faithfulness as token overlap between answer and context.
+
+    Measures what fraction of the answer's content tokens appear in the
+    retrieved context. Higher = more grounded, lower = more hallucinated.
+
+    Args:
+        predictions: List of generated answers.
+        contexts: List of concatenated retrieved passages per question.
+
+    Returns:
+        Mean faithfulness score (0-1).
+    """
+    scores = []
+    for pred, ctx in zip(predictions, contexts):
+        pred_tokens = Counter(normalize_turkish(pred).split())
+        ctx_tokens = set(normalize_turkish(ctx).split())
+
+        if not pred_tokens:
+            scores.append(0.0)
+            continue
+
+        grounded = sum(1 for t in pred_tokens if t in ctx_tokens)
+        scores.append(grounded / sum(pred_tokens.values()))
+
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def citation_accuracy(
+    predictions: list[str],
+    num_passages: int = 10,
+) -> dict[str, float]:
+    """Compute citation usage statistics in generated answers.
+
+    Checks how answers use [1], [2], etc. citation markers.
+
+    Args:
+        predictions: List of generated answers.
+        num_passages: Number of passages provided in context.
+
+    Returns:
+        Dict with citation_rate (fraction of answers with any citation),
+        mean_citations (avg citations per answer), and
+        valid_rate (fraction of citations referencing valid passage numbers).
+    """
+    has_citation = 0
+    total_citations = 0
+    valid_citations = 0
+    total_answers = len(predictions)
+
+    for pred in predictions:
+        cited = _CITATION_PATTERN.findall(pred)
+        if cited:
+            has_citation += 1
+        total_citations += len(cited)
+        valid_citations += sum(1 for c in cited if 1 <= int(c) <= num_passages)
+
+    return {
+        "citation_rate": has_citation / total_answers if total_answers else 0.0,
+        "mean_citations": total_citations / total_answers if total_answers else 0.0,
+        "valid_rate": valid_citations / total_citations if total_citations else 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
