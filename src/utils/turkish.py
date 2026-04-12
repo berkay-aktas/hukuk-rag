@@ -47,3 +47,19 @@ def turkish_tokenize(text: str) -> list[str]:
     """
     text = normalize_turkish(text)
     return [t for t in text.split() if t not in TURKISH_STOPWORDS and len(t) > 1]
+
+
+def content_tokens(text: str) -> set[str]:
+    """Extract content-bearing token set for retrieval relevance scoring.
+
+    Applies normalization, removes stopwords and tokens with fewer than
+    3 characters. Returns a set for efficient overlap computation.
+
+    Args:
+        text: Input text.
+
+    Returns:
+        Set of content tokens.
+    """
+    norm = normalize_turkish(text)
+    return {t for t in norm.split() if t not in TURKISH_STOPWORDS and len(t) > 2}
