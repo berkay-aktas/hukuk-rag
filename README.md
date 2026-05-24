@@ -1,125 +1,161 @@
 # Turkish Legal RAG System
 
-A domain-adapted Retrieval-Augmented Generation system for Turkish legal question answering, built on Yargıtay (Supreme Court) decisions and statutory law.
+A domain-adapted Retrieval-Augmented Generation system for Turkish legal question answering. Hybrid retrieval (FAISS + BM25 + RRF), optional cross-encoder reranking, Qwen2.5-7B generation with optional QLoRA adapter.
+
+## Quickstart (custom corpus + custom benchmark)
+
+The system is designed to be runnable end-to-end on any Turkish legal corpus and any Q&A benchmark — point the CLI at your own data and get scored results back.
+
+```bash
+# 1. Install
+pip install -r requirements.txt
+
+# 2. Index your corpus (any of: directory of PDFs/.txt/.md, JSONL, JSON array, Parquet)
+python -m hukuk_rag ingest \
+  --docs ./your_corpus_directory/ \
+  --out ./indexes/your_run/
+
+# 3. Score a Q&A file against the indexes
+python -m hukuk_rag benchmark \
+  --questions ./your_questions.jsonl \
+  --indexes ./indexes/your_run/ \
+  --variant base \
+  --report ./reports/your_run/
+
+# 4. Ad-hoc query
+python -m hukuk_rag query "Kasten adam öldürmenin cezası nedir?" \
+  --indexes ./indexes/your_run/ --show-passages
+```
+
+### Accepted input shapes
+
+**Corpus** — auto-detected from path:
+- Directory of `.pdf` / `.txt` / `.md` files — chunked via legal-aware chunker (`Madde N` boundaries → sections → paragraphs → token windows).
+- JSONL with one of two record schemas:
+  - Pre-chunked: `{"id"|"chunk_id": str, "text": str, ...metadata}`
+  - Raw documents: `{"id": str, "text": str, ...}` with `text` >2000 chars triggers chunking.
+- JSON array (top-level `[...]`) with the same record schema.
+- Parquet with `chunk_id` and `text` columns.
+
+**Benchmark** — auto-detected, supports three schemas:
+- Our own: `{"questions": [{question, gold_answer, madde_no, kaynak, ...}]}`
+- Shared `gold_benchmark.json`: array of `{question_id, question, verified_answer, gold_sources: [{corpus_row_id}]}`
+- Shared `rag_eval.json`: array of `{query_id, query, gold_chunk_ids: [str], gold_answer_extract}`
+- Any JSONL where each line has `{question|query, answer|verified_answer}` (+ optional `options` for MCQ).
+
+When chunk-level relevance labels are present (`gold_chunk_ids` or `gold_sources`), Recall@K / MRR / nDCG are computed with real ground truth. Otherwise only generation metrics are reported.
 
 ## Architecture
 
 ```
-                         USER QUESTION
-                              │
-                 ┌────────────▼────────────┐
-                 │     QUERY ANALYSIS       │
-                 │  • Domain classification │
-                 │  • Entity extraction     │
-                 │  • Query decomposition   │
-                 └────────────┬────────────┘
-                              │
-       ┌──────────────────────▼──────────────────────┐
-       │          HYBRID RETRIEVAL                    │
-       │                                             │
-       │  Dense (FAISS IVF-PQ)  ·  Sparse (BM25)    │
-       │  Fine-tuned E5-large   ·  Turkish tokenizer │
-       │           └──── RRF Fusion ────┘            │
-       └──────────────────────┬──────────────────────┘
-                              │ top-k
-       ┌──────────────────────▼──────────────────────┐
-       │          CROSS-ENCODER RERANKER              │
-       │                                             │
-       │  Fine-tuned BGE-reranker-v2-m3-turkish      │
-       │  + Legal metadata fusion (domain, recency,  │
-       │    court hierarchy)                          │
-       └──────────────────────┬──────────────────────┘
-                              │ top-10
-       ┌──────────────────────▼──────────────────────┐
-       │          ANSWER GENERATION                   │
-       │                                             │
-       │  QLoRA fine-tuned Qwen2.5-7B-Instruct       │
-       │  + Citation formatting                      │
-       │  + NLI-based claim verification             │
-       └──────────────────────┬──────────────────────┘
-                              │
-                  ANSWER + CITATIONS + CONFIDENCE
+   QUESTION
+      │
+      ▼
+  ┌───────────────────────────────┐
+  │  HYBRID RETRIEVAL             │
+  │   Dense (FAISS IVF-PQ)        │
+  │   + Sparse (BM25, Turkish)    │
+  │   ─── RRF fusion (k=60) ───   │
+  └────────────┬──────────────────┘
+               │ top-50 each → top-10 after RRF
+               ▼
+  ┌───────────────────────────────┐
+  │  RERANKER (optional)          │
+  │   Cross-encoder, BGE-reranker │
+  │   -v2-m3-turkish              │
+  └────────────┬──────────────────┘
+               │ top-10
+               ▼
+  ┌───────────────────────────────┐
+  │  GENERATION                   │
+  │   Qwen2.5-7B-Instruct (4-bit) │
+  │   + optional QLoRA adapter    │
+  │   + Turkish system prompt     │
+  └────────────┬──────────────────┘
+               │
+               ▼
+       ANSWER + [Kaynak N] CITATIONS
 ```
 
 ## Key Features
 
-- **Legal-aware chunking** — splits on `Madde` (article) boundaries, section headers, and paragraph breaks before falling back to token-based splitting
-- **Turkish language handling** — proper locale lowercasing (İ→i, I→ı), Turkish stopword lists, legal-specific regex patterns
-- **Fine-tuned embeddings** — `intfloat/multilingual-e5-large` adapted on 61k Turkish legal triplets with hard negatives
-- **Hybrid retrieval** — dense (FAISS IVF-PQ) + sparse (BM25) combined via Reciprocal Rank Fusion
-- **Evaluation suite** — Recall@K, MRR, nDCG, token F1, ROUGE-L with bootstrap 95% CIs and Wilcoxon significance tests
+- **Legal-aware chunking** — splits on `Madde N` (article) boundaries, then section headers (BÖLÜM/KISIM/FASIL), then paragraph breaks, falling back to token windows.
+- **Turkish language handling** — locale-aware lowercasing (İ→i, I→ı), Turkish stopwords for BM25, legal regex patterns.
+- **Fine-tuned embeddings** — `intfloat/multilingual-e5-large` adapted on Turkish legal triplets.
+- **Hybrid retrieval** — dense (FAISS IVF-PQ) + sparse (BM25) combined via Reciprocal Rank Fusion (Cormack et al. 2009).
+- **Statistical evaluation** — Recall@K, MRR, nDCG@K, Token F1, ROUGE-L, BLEU, faithfulness, citation accuracy. All comparisons reported with bootstrap 95% CIs and Wilcoxon signed-rank significance tests.
+- **Cross-LLM gold set audit** — 225-q hand-aligned gold set verified by an independent LLM auditor against canonical mevzuat.gov.tr text. See `reports/gold_audit.json` for full audit verdicts.
 
 ## Models
 
 | Component | Model | Parameters |
-|-----------|-------|------------|
+|-----------|-------|-----------:|
 | Embedding | `intfloat/multilingual-e5-large` | 560M |
-| Embedding (alt) | `msbayindir/legal-text-embedding-turkish-v1` | 82M |
-| ColBERT | `colbert-ir/colbertv2.0` | 110M |
 | Reranker | `seroe/bge-reranker-v2-m3-turkish-triplet` | 560M |
 | Generator | `Qwen/Qwen2.5-7B-Instruct` | 7B |
-| NLI | `emrecan/bert-base-turkish-cased-mean-nli-stsb-tr` | 110M |
+| NLI (faithfulness) | `emrecan/bert-base-turkish-cased-mean-nli-stsb-tr` | 110M |
 
 ## Datasets
 
 | Dataset | Size | Use |
 |---------|------|-----|
-| [Turkish-Law-Documents-700k-clustered](https://huggingface.co/datasets/erdem-erdem/Turkish-Law-Documents-700k-clustered) | 702k decisions | RAG corpus |
-| [turkish_law_qa_dataset](https://huggingface.co/datasets/OrionCAF/turkish_law_qa_dataset) | 18.3k pairs | QA training |
-| [turkish-law-chatbot](https://huggingface.co/datasets/Renicames/turkish-law-chatbot) | 14.9k pairs | QA training |
-| [turkishlaw-dataset](https://www.kaggle.com/datasets/batuhankalem/turkishlaw-dataset-for-llm-finetuning) | — | Fine-tuning |
+| [Turkish-Law-Documents-700k-clustered](https://huggingface.co/datasets/erdem-erdem/Turkish-Law-Documents-700k-clustered) | 702k decisions | Retrieval corpus |
+| [turkish_law_qa_dataset](https://huggingface.co/datasets/OrionCAF/turkish_law_qa_dataset) | 18.3k pairs | Embedding triplets |
+| [turkish-law-chatbot](https://huggingface.co/datasets/Renicames/turkish-law-chatbot) | 14.9k pairs | LLM SFT |
+| [turkishlaw-dataset](https://www.kaggle.com/datasets/batuhankalem/turkishlaw-dataset-for-llm-finetuning) | 5k pairs | LLM SFT |
 
 ## Project Structure
 
 ```
-├── notebooks/              # Experiment notebooks (01-07)
-│   └── 01_data_and_baseline.ipynb
+├── hukuk_rag/              # CLI entrypoint (python -m hukuk_rag ...)
+├── notebooks/              # Experiment notebooks
+│   ├── 01_data_and_baseline.ipynb
+│   ├── 02_ablation_evaluation.ipynb
+│   ├── 03_statistical_analysis.ipynb
+│   ├── 04_phase0_calibration.ipynb
+│   └── scratchpads/        # Reference notebooks from prior sessions
 ├── src/
-│   ├── data/               # Chunking, preprocessing, gold set management
+│   ├── data/               # Chunking, preprocessing, gold set
 │   ├── retrieval/          # Dense (FAISS), sparse (BM25), RRF fusion
-│   ├── evaluation/         # Metrics, bootstrap CI, significance tests
-│   └── utils/              # Config, Turkish NLP, device management
-├── configs/
-│   └── config.yaml         # Hyperparameters, model identifiers, paths
+│   ├── reranker/           # Cross-encoder loader + scoring
+│   ├── generation/         # Qwen loader, RAG pipeline, prompts
+│   ├── evaluation/         # Metrics, bootstrap CI, Wilcoxon
+│   ├── pipeline/           # Ingest, benchmark, CLI
+│   └── utils/              # Config, Turkish NLP
+├── configs/                # Hyperparameters (config.yaml)
 ├── data/
-│   └── gold/               # Held-out evaluation set (never trained on)
+│   ├── gold/               # 225-q held-out evaluation set (NEVER trained on)
+│   └── external/           # Optional supplementary datasets (gitignored)
+├── reports/                # Retrospective, progress report, audit results
 └── requirements.txt
 ```
 
 ## Setup
 
 ```bash
-# Clone
 git clone https://github.com/berkay-aktas/hukuk-rag.git
 cd hukuk-rag
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-The system is designed for **Google Colab with T4 GPU** (16 GB VRAM). All fine-tuning uses QLoRA/4-bit quantization to fit within memory constraints. Artifacts (indexes, checkpoints, processed data) are persisted to Google Drive.
+Designed primarily for **Google Colab with T4 GPU** (16 GB VRAM). QLoRA / 4-bit quantization is used for all LLM operations to fit within memory constraints. Artifacts (indexes, checkpoints, processed corpora) are persisted to Google Drive.
 
-## Usage
-
-Each notebook is self-contained and runnable top-to-bottom on a fresh Colab session. Outputs are checkpointed to Drive, so interrupted sessions resume automatically.
-
-```python
-from src.retrieval import dense_search, bm25_search, rrf_merge, load_faiss_index, load_bm25_index
-from src.evaluation import retrieval_metrics, generation_metrics, bootstrap_ci
-```
+For local use on Mac/Linux without GPU, the ingest and benchmark pipelines work (BM25 is CPU-only, FAISS has CPU support via `faiss-cpu`). LLM generation requires a GPU.
 
 ## Ablation Configurations
 
-| Config | Description |
-|--------|-------------|
-| C1 | Baseline: off-shelf E5 + BM25 + RRF + vanilla Qwen 4-bit |
-| C2 | + Fine-tuned embeddings |
-| C3 | + Fine-tuned reranker + legal metadata fusion |
-| C4 | + QLoRA fine-tuned LLM |
-| C5 | + Contextual chunks + proposition indexing |
-| C6 | + Knowledge graph + citation chains |
-| C7 | + CRAG + document-level reranking |
-| C8 | Full agentic system |
+Six configurations evaluated on the 225-question gold set with a standardized prompt template:
+
+| Config | Embedding | Reranker | Generator |
+|--------|-----------|----------|-----------|
+| C1 Baseline | Base E5 | — | Base Qwen |
+| C2 + FT embedding | FT E5 | — | Base Qwen |
+| C3 + FT reranker | FT E5 | FT cross-encoder | Base Qwen |
+| C4 + QLoRA LLM | Base E5 | — | QLoRA Qwen |
+| C5 FT embed + QLoRA | FT E5 | — | QLoRA Qwen |
+| C6 Full system | FT E5 | FT cross-encoder | QLoRA Qwen |
+
+Results, statistical tests, and per-question outputs are in `reports/progress_report.pdf` (April 2026 progress submission). Key findings: embedding fine-tuning yields the largest single-component gain (+19% Token F1, p<0.003); the silver-label-trained reranker degrades downstream quality (−11% F1, p<0.001); QLoRA improves BERTScore (p=0.001) but not Token F1 (p=0.45 — surface-overlap metric undervalues semantic improvement).
 
 ## License
 
