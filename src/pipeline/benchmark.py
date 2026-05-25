@@ -152,6 +152,7 @@ def run_benchmark(
     bootstrap_iterations: int = 1000,
     bootstrap_alpha: float = 0.05,
     save_predictions: bool = True,
+    resume: bool = True,
 ) -> dict[str, Any]:
     """Run a benchmark through ``pipeline`` and write a metrics report.
 
@@ -179,14 +180,33 @@ def run_benchmark(
     contexts_joined: list[str] = []   # one string per prediction (passages joined)
     per_question_records: list[dict[str, Any]] = []
 
-    # Resume support + crash safety: stream per-question records to disk as we go.
-    # If the cell crashes mid-aggregation we still have everything on disk.
+    # Resume from on-disk predictions.jsonl if present + resume=True (default).
+    # Set resume=False to force a fresh run.
     preds_path = output_dir / "predictions.jsonl" if save_predictions else None
+    completed_qids: set[str] = set()
     if preds_path and preds_path.exists():
-        preds_path.unlink()  # fresh start to avoid mixing runs
+        if resume:
+            with open(preds_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    completed_qids.add(rec["question_id"])
+                    predictions.append(rec["predicted_answer"])
+                    references.append(rec["gold_answer"])
+                    retrieved_ids.append(rec["retrieved_chunk_ids"])
+                    relevant_ids.append(rec.get("gold_chunk_ids") or [])
+                    contexts_joined.append("")  # not stored per-record; faithfulness will be re-computed
+                    per_question_records.append(rec)
+            logger.info("Resuming: %d question(s) already completed", len(completed_qids))
+        else:
+            preds_path.unlink()
 
     started = time.time()
-    for ex in tqdm(examples, desc="Benchmark"):
+    for ex in tqdm(examples, desc="Benchmark", initial=len(completed_qids)):
+        if ex.question_id in completed_qids:
+            continue
         try:
             resp = pipeline.answer(ex.question, options=ex.options)
         except Exception as e:
