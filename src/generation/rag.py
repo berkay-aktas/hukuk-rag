@@ -43,22 +43,30 @@ class RagResponse:
 
 @dataclass
 class RagPipeline:
-    """Loaded RAG components and the orchestration logic that combines them."""
+    """Loaded RAG components and the orchestration logic that combines them.
 
-    faiss_index: faiss.Index | None
-    faiss_mapping: list[dict[str, Any]] | None
-    bm25_index: Any | None
-    bm25_mapping: list[dict[str, Any]] | None
+    Supports retrieval over MULTIPLE corpora simultaneously: each corpus contributes
+    its own FAISS dense index and/or BM25 sparse index, and results are RRF-merged
+    across all sources. The embedding model is shared across all FAISS sources, so
+    all dense indexes must have been built with the same model (or compatible ones).
+
+    For a single corpus, pass single-item lists; for combined retrieval over Yargıtay
+    + shared + Mevzuat, pass multiple sources.
+    """
+
+    # Dense + sparse sources. Each source is (faiss_index, mapping) or (bm25_index, mapping).
+    dense_sources: list[tuple[Any, list[dict[str, Any]]]]
+    bm25_sources: list[tuple[Any, list[dict[str, Any]]]]
     embed_model: SentenceTransformer | None
     llm: LoadedLLM
     reranker: LoadedReranker | None = None
     system_prompt: str = DEFAULT_SYSTEM
 
-    # Retrieval params
+    # Per-source retrieval depth — used as top-k for each individual source before RRF
     dense_top_k: int = 50
     bm25_top_k: int = 50
     rrf_k: int = 60
-    rerank_top_k: int = 10
+    rerank_top_k: int = 30
     final_top_k: int = 10
 
     # Generation params
@@ -69,7 +77,7 @@ class RagPipeline:
     @classmethod
     def from_paths(
         cls,
-        index_dir: Path | str,
+        index_dir: Path | str | list[Path | str],
         *,
         embedding_model: str | None = None,
         llm_base_model: str = "Qwen/Qwen2.5-7B-Instruct",
@@ -80,64 +88,117 @@ class RagPipeline:
         use_faiss: bool = True,
         system_prompt: str = DEFAULT_SYSTEM,
     ) -> RagPipeline:
-        """Load a pipeline from an index bundle directory.
+        """Load a pipeline from one or more index bundle directories.
 
         Args:
-            index_dir: A directory written by :func:`src.pipeline.ingest.build_indexes`.
-            embedding_model: Override the embedding model. Defaults to the one
-                recorded in the bundle manifest (or multilingual-e5-large).
+            index_dir: Either a single index bundle directory, or a list of them.
+                When a list is provided, retrieval runs against ALL of them in
+                parallel and results are RRF-merged.
+            embedding_model: Override the embedding model. Required if any index
+                bundle lacks a manifest.json.
             llm_base_model: HuggingFace model id for the base LLM.
             qlora_adapter: Optional path to a QLoRA adapter directory.
-            reranker_model: HuggingFace id or local path. None = use off-shelf default.
-            use_reranker: Whether to enable the reranker stage (slow + currently
-                degrades quality if the FT adapter is the silver-label one).
+            reranker_model: HuggingFace id or local path. None = off-shelf default.
+            use_reranker: Whether to enable the reranker stage.
             use_bm25: Include BM25 in the first-stage retrieval.
             use_faiss: Include FAISS in the first-stage retrieval.
-            system_prompt: Which system prompt to use. Defaults to DEFAULT_SYSTEM.
+            system_prompt: Which system prompt to use.
         """
         import json
 
-        index_dir = Path(index_dir)
-        manifest_path = index_dir / "manifest.json"
-        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        if isinstance(index_dir, (str, Path)):
+            index_dirs = [Path(index_dir)]
+        else:
+            index_dirs = [Path(d) for d in index_dir]
 
-        embed_model_id = embedding_model or manifest.get("embedding_model")
+        # Resolve embedding model: prefer explicit, then any manifest
+        embed_model_id = embedding_model
+        for d in index_dirs:
+            manifest_path = d / "manifest.json"
+            if manifest_path.exists() and embed_model_id is None:
+                m = json.loads(manifest_path.read_text())
+                embed_model_id = m.get("embedding_model")
 
-        # Dense
-        faiss_index = faiss_mapping = embed_model = None
+        dense_sources: list[tuple[Any, list[dict[str, Any]]]] = []
+        bm25_sources: list[tuple[Any, list[dict[str, Any]]]] = []
+        embed_model = None
+
         if use_faiss:
-            faiss_path = index_dir / "faiss.index"
-            if not faiss_path.exists():
-                raise FileNotFoundError(f"{faiss_path} missing — rebuild with build_indexes(build_faiss=True)")
-            faiss_index, faiss_mapping = load_faiss_index(faiss_path)
             if embed_model_id is None:
                 raise ValueError(
                     "Cannot infer embedding model. Pass embedding_model= explicitly "
-                    "or ensure manifest.json records it."
+                    "or ensure at least one index has manifest.json."
                 )
-            embed_model = load_embedding_model(embed_model_id)
+            for d in index_dirs:
+                faiss_path = d / "faiss.index"
+                if faiss_path.exists():
+                    dense_sources.append(load_faiss_index(faiss_path))
+            if dense_sources:
+                embed_model = load_embedding_model(embed_model_id)
 
-        # Sparse
-        bm25_index = bm25_mapping = None
         if use_bm25:
-            bm25_path = index_dir / "bm25.pkl"
-            if not bm25_path.exists():
-                raise FileNotFoundError(f"{bm25_path} missing — rebuild with build_indexes(build_bm25=True)")
-            bm25_index, bm25_mapping = load_bm25_index(bm25_path)
+            for d in index_dirs:
+                bm25_path = d / "bm25.pkl"
+                if bm25_path.exists():
+                    bm25_sources.append(load_bm25_index(bm25_path))
 
-        # LLM
+        if not dense_sources and not bm25_sources:
+            raise FileNotFoundError(
+                f"No faiss.index or bm25.pkl found in any of: {[str(d) for d in index_dirs]}"
+            )
+
         llm = load_llm(base_model=llm_base_model, adapter_path=qlora_adapter)
 
-        # Reranker
         reranker = None
         if use_reranker:
-            reranker = load_reranker(reranker_model if reranker_model else "seroe/bge-reranker-v2-m3-turkish-triplet")
+            reranker = load_reranker(
+                reranker_model if reranker_model else "seroe/bge-reranker-v2-m3-turkish-triplet"
+            )
 
         return cls(
-            faiss_index=faiss_index,
-            faiss_mapping=faiss_mapping,
-            bm25_index=bm25_index,
-            bm25_mapping=bm25_mapping,
+            dense_sources=dense_sources,
+            bm25_sources=bm25_sources,
+            embed_model=embed_model,
+            llm=llm,
+            reranker=reranker,
+            system_prompt=system_prompt,
+        )
+
+    @classmethod
+    def from_mixed_sources(
+        cls,
+        dense_index_paths: list[Path | str] = (),
+        bm25_index_paths: list[Path | str] = (),
+        *,
+        embedding_model: str,
+        llm_base_model: str = "Qwen/Qwen2.5-7B-Instruct",
+        qlora_adapter: Path | str | None = None,
+        reranker_model: Path | str | None = None,
+        use_reranker: bool = False,
+        system_prompt: str = DEFAULT_SYSTEM,
+    ) -> RagPipeline:
+        """Load from EXPLICIT lists of faiss + bm25 paths.
+
+        Use when sources live in different directories with different filename
+        conventions (e.g. combining a manifest-aware bundle with a legacy
+        Yargıtay layout where faiss is faiss_ft.index and bm25 is bm25.pkl
+        in a sibling directory). Each path must have a matching .mapping.pkl
+        sibling for the FAISS case.
+        """
+        dense_sources = [load_faiss_index(Path(p)) for p in dense_index_paths]
+        bm25_sources = [load_bm25_index(Path(p)) for p in bm25_index_paths]
+
+        embed_model = load_embedding_model(embedding_model) if dense_sources else None
+        llm = load_llm(base_model=llm_base_model, adapter_path=qlora_adapter)
+        reranker = None
+        if use_reranker:
+            reranker = load_reranker(
+                reranker_model if reranker_model else "seroe/bge-reranker-v2-m3-turkish-triplet"
+            )
+
+        return cls(
+            dense_sources=dense_sources,
+            bm25_sources=bm25_sources,
             embed_model=embed_model,
             llm=llm,
             reranker=reranker,
@@ -145,21 +206,20 @@ class RagPipeline:
         )
 
     def retrieve(self, query: str) -> list[RetrievalResult]:
-        """First-stage retrieval: dense + BM25 + RRF fusion."""
+        """First-stage retrieval: query every source, RRF-merge across all."""
         result_lists: list[list[RetrievalResult]] = []
 
-        if self.faiss_index is not None and self.embed_model is not None:
-            dense_results = dense_search(
-                query, self.faiss_index, self.faiss_mapping, self.embed_model, k=self.dense_top_k
-            )
-            result_lists.append(dense_results)
+        if self.embed_model is not None:
+            for faiss_idx, mapping in self.dense_sources:
+                result_lists.append(
+                    dense_search(query, faiss_idx, mapping, self.embed_model, k=self.dense_top_k)
+                )
 
-        if self.bm25_index is not None and self.bm25_mapping is not None:
-            sparse_results = bm25_search(query, self.bm25_index, self.bm25_mapping, k=self.bm25_top_k)
-            result_lists.append(sparse_results)
+        for bm25_idx, mapping in self.bm25_sources:
+            result_lists.append(bm25_search(query, bm25_idx, mapping, k=self.bm25_top_k))
 
         if not result_lists:
-            raise RuntimeError("No retrievers enabled — at least one of FAISS or BM25 must be loaded.")
+            raise RuntimeError("No retrievers enabled — load at least one FAISS or BM25 source.")
 
         if len(result_lists) == 1:
             return result_lists[0]
