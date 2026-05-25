@@ -239,7 +239,8 @@ def run_benchmark(
             return None
 
     gen = _safe("generation", lambda: generation_metrics(predictions, references)) or {}
-    faith = _safe("faithfulness", lambda: faithfulness_score(predictions, contexts_joined)) or {}
+    faith_score = _safe("faithfulness", lambda: faithfulness_score(predictions, contexts_joined))
+    faith = {"token_overlap": faith_score} if faith_score is not None else {}
     cite = _safe("citation", lambda: citation_accuracy(predictions, num_passages=pipeline.final_top_k)) or {}
 
     # Retrieval metrics — only if we have any chunk-level labels
@@ -247,11 +248,16 @@ def run_benchmark(
     if any(relevant_ids):
         filtered_ret = [r for r, rel in zip(retrieved_ids, relevant_ids) if rel]
         filtered_rel = [rel for rel in relevant_ids if rel]
-        ret = _safe("retrieval", lambda: retrieval_metrics(filtered_ret, filtered_rel, ks=(5, 10)))
+        ret = _safe("retrieval", lambda: retrieval_metrics(filtered_ret, filtered_rel))
 
-    # Bootstrap CIs on the primary generation metric
+    # Bootstrap CIs on Token F1
     f1_per_q = [token_f1([p], [r]) for p, r in zip(predictions, references)]
-    f1_ci = _safe("bootstrap", lambda: bootstrap_ci(f1_per_q, n=bootstrap_iterations, alpha=bootstrap_alpha)) or (0.0, 0.0)
+    point_f1 = sum(f1_per_q) / len(f1_per_q) if f1_per_q else 0.0
+    boot = _safe(
+        "bootstrap",
+        lambda: bootstrap_ci(token_f1, predictions, references,
+                             n=bootstrap_iterations, alpha=bootstrap_alpha),
+    ) or {"mean": point_f1, "lower": point_f1, "upper": point_f1}
 
     summary = {
         "benchmark_path": str(benchmark_path),
@@ -269,7 +275,7 @@ def run_benchmark(
         "faithfulness": faith,
         "citation": cite,
         "retrieval": ret,
-        "token_f1_95ci": {"point": round(sum(f1_per_q) / len(f1_per_q), 4), "ci_low": round(f1_ci[0], 4), "ci_high": round(f1_ci[1], 4)},
+        "token_f1_95ci": {"point": round(point_f1, 4), "ci_low": round(boot["lower"], 4), "ci_high": round(boot["upper"], 4)},
     }
 
     # Write outputs (predictions were already streamed during the loop)
@@ -295,11 +301,6 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
         f"- **LLM:** `{summary['pipeline']['llm_base']}`"
         + (f" + QLoRA adapter `{summary['pipeline']['qlora_adapter']}`" if summary['pipeline']['qlora_adapter'] else ""),
         f"- **Reranker:** {summary['pipeline']['reranker'] or 'none'}",
-        "",
-        "## Generation",
-        "",
-        "| Metric | Value |",
-        "|---|---|",
     ]
     def _emit_section(title: str, data: dict | None) -> None:
         if not data:
