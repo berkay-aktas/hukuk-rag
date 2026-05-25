@@ -176,8 +176,14 @@ def run_benchmark(
     references: list[str] = []
     retrieved_ids: list[list[str]] = []
     relevant_ids: list[list[str]] = []
-    contexts: list[list[str]] = []
+    contexts_joined: list[str] = []   # one string per prediction (passages joined)
     per_question_records: list[dict[str, Any]] = []
+
+    # Resume support + crash safety: stream per-question records to disk as we go.
+    # If the cell crashes mid-aggregation we still have everything on disk.
+    preds_path = output_dir / "predictions.jsonl" if save_predictions else None
+    if preds_path and preds_path.exists():
+        preds_path.unlink()  # fresh start to avoid mixing runs
 
     started = time.time()
     for ex in tqdm(examples, desc="Benchmark"):
@@ -201,13 +207,10 @@ def run_benchmark(
         predictions.append(pred)
         references.append(ex.gold_answer)
         retrieved_ids.append([r.chunk_id for r in retrieved])
-        if ex.gold_chunk_ids:
-            relevant_ids.append(ex.gold_chunk_ids)
-        else:
-            relevant_ids.append([])
-        contexts.append([r.text for r in reranked])
+        relevant_ids.append(ex.gold_chunk_ids or [])
+        contexts_joined.append("\n\n".join(r.text for r in reranked))
 
-        per_question_records.append({
+        rec = {
             "question_id": ex.question_id,
             "question": ex.question,
             "gold_answer": ex.gold_answer,
@@ -217,30 +220,38 @@ def run_benchmark(
             "gold_chunk_ids": ex.gold_chunk_ids,
             "timing": timing,
             "metadata": ex.metadata,
-        })
+        }
+        per_question_records.append(rec)
+        if preds_path:
+            with open(preds_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     total_seconds = round(time.time() - started, 1)
     logger.info("Benchmark complete: %d questions in %.1fs", len(examples), total_seconds)
 
-    # Generation metrics
-    gen = generation_metrics(predictions, references)
+    # Aggregate metrics — wrap each in try/except so partial failure
+    # still produces a usable summary instead of losing all the work.
+    def _safe(label, fn):
+        try:
+            return fn()
+        except Exception as e:
+            logger.warning("Aggregate metric %s failed: %s", label, e)
+            return None
 
-    # Faithfulness + citation
-    faith = faithfulness_score(predictions, contexts)
-    cite = citation_accuracy(predictions, num_passages=pipeline.final_top_k)
+    gen = _safe("generation", lambda: generation_metrics(predictions, references)) or {}
+    faith = _safe("faithfulness", lambda: faithfulness_score(predictions, contexts_joined)) or {}
+    cite = _safe("citation", lambda: citation_accuracy(predictions, num_passages=pipeline.final_top_k)) or {}
 
     # Retrieval metrics — only if we have any chunk-level labels
-    has_chunk_labels = any(r for r in relevant_ids)
     ret: dict[str, float] | None = None
-    if has_chunk_labels:
-        # Filter to only examples that have labels for retrieval metrics
+    if any(relevant_ids):
         filtered_ret = [r for r, rel in zip(retrieved_ids, relevant_ids) if rel]
         filtered_rel = [rel for rel in relevant_ids if rel]
-        ret = retrieval_metrics(filtered_ret, filtered_rel, ks=(5, 10))
+        ret = _safe("retrieval", lambda: retrieval_metrics(filtered_ret, filtered_rel, ks=(5, 10)))
 
     # Bootstrap CIs on the primary generation metric
     f1_per_q = [token_f1([p], [r]) for p, r in zip(predictions, references)]
-    f1_ci = bootstrap_ci(f1_per_q, n=bootstrap_iterations, alpha=bootstrap_alpha)
+    f1_ci = _safe("bootstrap", lambda: bootstrap_ci(f1_per_q, n=bootstrap_iterations, alpha=bootstrap_alpha)) or (0.0, 0.0)
 
     summary = {
         "benchmark_path": str(benchmark_path),
@@ -261,17 +272,10 @@ def run_benchmark(
         "token_f1_95ci": {"point": round(sum(f1_per_q) / len(f1_per_q), 4), "ci_low": round(f1_ci[0], 4), "ci_high": round(f1_ci[1], 4)},
     }
 
-    # Write outputs
+    # Write outputs (predictions were already streamed during the loop)
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("Wrote %s", summary_path)
-
-    if save_predictions:
-        preds_path = output_dir / "predictions.jsonl"
-        with open(preds_path, "w", encoding="utf-8") as f:
-            for rec in per_question_records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        logger.info("Wrote %s", preds_path)
 
     md_path = output_dir / "summary.md"
     md_path.write_text(_format_summary_markdown(summary), encoding="utf-8")
@@ -297,22 +301,19 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
         "| Metric | Value |",
         "|---|---|",
     ]
-    for k, v in summary["generation"].items():
-        lines.append(f"| {k} | {v:.4f} |" if isinstance(v, (int, float)) else f"| {k} | {v} |")
-    ci = summary["token_f1_95ci"]
-    lines.append(f"| token_f1 (bootstrap 95% CI) | {ci['point']:.4f} [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
+    def _emit_section(title: str, data: dict | None) -> None:
+        if not data:
+            return
+        lines.extend(["", f"## {title}", "", "| Metric | Value |", "|---|---|"])
+        for k, v in data.items():
+            lines.append(f"| {k} | {v:.4f} |" if isinstance(v, (int, float)) else f"| {k} | {v} |")
 
-    if summary["retrieval"]:
-        lines.extend(["", "## Retrieval", "", "| Metric | Value |", "|---|---|"])
-        for k, v in summary["retrieval"].items():
-            lines.append(f"| {k} | {v:.4f} |")
-
-    lines.extend(["", "## Faithfulness", "", "| Metric | Value |", "|---|---|"])
-    for k, v in summary["faithfulness"].items():
-        lines.append(f"| {k} | {v:.4f} |")
-
-    lines.extend(["", "## Citation", "", "| Metric | Value |", "|---|---|"])
-    for k, v in summary["citation"].items():
-        lines.append(f"| {k} | {v:.4f} |")
+    _emit_section("Generation", summary.get("generation"))
+    ci = summary.get("token_f1_95ci") or {}
+    if ci:
+        lines.append(f"| token_f1 (bootstrap 95% CI) | {ci['point']:.4f} [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
+    _emit_section("Retrieval", summary.get("retrieval"))
+    _emit_section("Faithfulness", summary.get("faithfulness"))
+    _emit_section("Citation", summary.get("citation"))
 
     return "\n".join(lines) + "\n"
