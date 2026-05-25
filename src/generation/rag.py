@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.generation.llm import LoadedLLM, generate_answer, load_llm
-from src.generation.prompts import DEFAULT_SYSTEM, MCQ_SYSTEM, build_user_message
+from src.generation.prompts import (
+    CITATION_STRICT_SYSTEM,
+    DEFAULT_SYSTEM,
+    MCQ_SYSTEM,
+    build_user_message,
+)
 from src.reranker.cross_encoder import LoadedReranker, load_reranker, rerank
 from src.retrieval.bm25 import bm25_search, load_bm25_index
 from src.retrieval.dense import dense_search, load_embedding_model, load_faiss_index
@@ -69,9 +74,12 @@ class RagPipeline:
     rerank_top_k: int = 30
     final_top_k: int = 10
 
-    # Generation params
+    # Generation params. Defaults to greedy decoding (do_sample=False via temperature=0)
+    # because sampling occasionally derails base Qwen 4-bit into CJK characters on noisy
+    # Turkish legal contexts. Greedy is deterministic and stable; reproducibility wins
+    # over diversity for benchmark eval.
     max_new_tokens: int = 256
-    temperature: float = 0.1
+    temperature: float = 0.0
     repetition_penalty: float = 1.2
 
     @classmethod

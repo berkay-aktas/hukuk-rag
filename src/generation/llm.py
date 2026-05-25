@@ -167,16 +167,18 @@ def generate_answer(
     )
     inputs = llm.tokenizer(prompt, return_tensors="pt").to(llm.model.device)
 
+    # Greedy path drops temperature/top_p to avoid HF "you set X with do_sample=False" warnings.
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        repetition_penalty=repetition_penalty,
+        do_sample=do_sample,
+        pad_token_id=llm.tokenizer.eos_token_id,
+    )
+    if do_sample:
+        gen_kwargs.update(temperature=temperature, top_p=top_p)
+
     with torch.inference_mode():
-        outputs = llm.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            do_sample=do_sample,
-            pad_token_id=llm.tokenizer.eos_token_id,
-        )
+        outputs = llm.model.generate(**inputs, **gen_kwargs)
 
     # Strip the prompt prefix — only return the newly generated tokens.
     generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
