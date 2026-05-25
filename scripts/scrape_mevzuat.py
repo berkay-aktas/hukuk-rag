@@ -169,34 +169,64 @@ def _fetch(url: str, timeout_s: int, insecure: bool) -> bytes:
         return resp.read()
 
 
+def _is_valid_pdf(content: bytes) -> bool:
+    """Reject HTML error pages disguised as .pdf downloads."""
+    head = content.lstrip()[:8]
+    return head.startswith(b"%PDF-")
+
+
 def download_statute(
-    s: Statute, out_dir: Path, *, delay_s: float = 1.0, timeout_s: int = 30, insecure: bool = False,
+    s: Statute, out_dir: Path, *, delay_s: float = 1.0, timeout_s: int = 30,
+    insecure: bool = False, retry_tertips: tuple[int, ...] = (1, 2, 3, 4, 5),
 ) -> dict:
-    """Download one statute as PDF. Returns a manifest record."""
-    url = f"{BASE_URL}/{s.tertip}.{s.tur}.{s.no}.pdf"
+    """Download one statute as PDF. Returns a manifest record.
+
+    Tries the declared ``tertip`` first; if the server returns an HTML error
+    page (not a real PDF), retries with other common ``tertip`` values.
+    """
     out_path = out_dir / f"{s.name}.pdf"
-    record = {"name": s.name, "no": s.no, "url": url, "path": str(out_path)}
+    record = {"name": s.name, "no": s.no, "path": str(out_path), "attempts": []}
 
     if out_path.exists() and out_path.stat().st_size > 1024:
-        record["status"] = "already_downloaded"
-        record["size_bytes"] = out_path.stat().st_size
-        return record
+        with open(out_path, "rb") as f:
+            head = f.read(8)
+        if head.startswith(b"%PDF-"):
+            record["status"] = "already_downloaded"
+            record["size_bytes"] = out_path.stat().st_size
+            return record
+        # Stale HTML masquerading as PDF — re-download
+        out_path.unlink()
 
-    try:
-        content = _fetch(url, timeout_s=timeout_s, insecure=insecure)
-        out_path.write_bytes(content)
-        record["status"] = "downloaded"
-        record["size_bytes"] = len(content)
-    except urllib.error.HTTPError as e:
-        record["status"] = "http_error"
-        record["error_code"] = e.code
-        record["error_msg"] = str(e)
-    except Exception as e:
-        record["status"] = "error"
-        record["error_msg"] = str(e)
-    finally:
+    # Tertip candidates: declared one first, then fallbacks (de-duplicated, order preserved)
+    candidates = list(dict.fromkeys([s.tertip, *retry_tertips]))
+
+    for tertip in candidates:
+        url = f"{BASE_URL}/{tertip}.{s.tur}.{s.no}.pdf"
+        attempt = {"tertip": tertip, "url": url}
+        try:
+            content = _fetch(url, timeout_s=timeout_s, insecure=insecure)
+            attempt["http"] = "200"
+            attempt["bytes"] = len(content)
+            if _is_valid_pdf(content):
+                out_path.write_bytes(content)
+                record["status"] = "downloaded"
+                record["size_bytes"] = len(content)
+                record["used_tertip"] = tertip
+                record["url"] = url
+                record["attempts"].append(attempt)
+                time.sleep(delay_s)
+                return record
+            attempt["note"] = "html_error_page"
+        except urllib.error.HTTPError as e:
+            attempt["http"] = str(e.code)
+            attempt["note"] = str(e)
+        except Exception as e:
+            attempt["note"] = str(e)
+        record["attempts"].append(attempt)
         time.sleep(delay_s)
 
+    record["status"] = "failed_all_tertips"
+    record["url"] = candidates[0]
     return record
 
 
