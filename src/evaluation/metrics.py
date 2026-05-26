@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -274,6 +274,67 @@ def generation_metrics(
     return metrics
 
 
+def bertscore(
+    predictions: list[str],
+    references: list[str],
+    *,
+    model_type: str = "bert-base-multilingual-cased",
+    lang: str = "tr",
+    batch_size: int = 32,
+    device: str | None = None,
+    rescale_with_baseline: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Compute corpus-level BERTScore (P/R/F1) with a multilingual BERT.
+
+    Defaults to ``bert-base-multilingual-cased`` to match notebook 03's
+    ablation report. BERTScore captures semantic similarity beyond lexical
+    overlap; for agglutinative Turkish it typically scores ~3x higher than
+    Token F1 because morphological variants get partial credit instead of
+    being counted as misses.
+
+    Args:
+        predictions: Predicted answers (candidates).
+        references: Reference answers.
+        model_type: HuggingFace model id used for contextual embeddings.
+        lang: Language code passed to ``bert_score`` (affects tokenization
+            and the baseline file when ``rescale_with_baseline=True``).
+        batch_size: Embed batch size; lower if CUDA OOM.
+        device: ``"cuda"``/``"cpu"``/``None`` (None → bert_score auto-picks).
+        rescale_with_baseline: Subtract empirical baseline (requires baseline
+            file download; we leave False to avoid the extra fetch).
+        verbose: bert_score's internal tqdm.
+
+    Returns:
+        Dict with mean ``precision``/``recall``/``f1`` and ``per_question_f1``
+        (the latter feeds bootstrap CIs without re-running BERT).
+
+    Raises:
+        ImportError: if ``bert_score`` is not installed.
+    """
+    from bert_score import score as _bert_score_fn
+
+    if not predictions:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "per_question_f1": []}
+
+    P, R, F1 = _bert_score_fn(
+        cands=predictions,
+        refs=references,
+        model_type=model_type,
+        lang=lang,
+        batch_size=batch_size,
+        device=device,
+        rescale_with_baseline=rescale_with_baseline,
+        verbose=verbose,
+    )
+    return {
+        "precision": float(P.mean().item()),
+        "recall": float(R.mean().item()),
+        "f1": float(F1.mean().item()),
+        "per_question_f1": F1.cpu().numpy().tolist(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Faithfulness and citation metrics
 # ---------------------------------------------------------------------------
@@ -394,6 +455,46 @@ def bootstrap_ci(
         "mean": float(np.mean(scores)),
         "lower": float(lower),
         "upper": float(upper),
+    }
+
+
+def bootstrap_ci_scores(
+    per_question_scores: list[float],
+    *,
+    n: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Percentile bootstrap CI for the mean of pre-computed per-question scores.
+
+    Use this when the metric itself is expensive to recompute per resample
+    (e.g., BERTScore — re-running the BERT forward pass 1000 times would be
+    prohibitive). For metrics that are cheap to recompute (e.g., token F1),
+    :func:`bootstrap_ci` is the correct choice because it resamples the raw
+    (prediction, reference) pairs.
+
+    Args:
+        per_question_scores: One scalar score per question.
+        n: Number of bootstrap resamples.
+        alpha: Significance level (default 0.05 → 95% CI).
+        seed: Random seed.
+
+    Returns:
+        Dict with mean, lower, upper.
+    """
+    arr = np.asarray(per_question_scores, dtype=float)
+    if arr.size == 0:
+        return {"mean": 0.0, "lower": 0.0, "upper": 0.0}
+
+    rng = np.random.default_rng(seed)
+    means = np.empty(n, dtype=float)
+    for i in range(n):
+        means[i] = arr[rng.integers(0, arr.size, size=arr.size)].mean()
+    means.sort()
+    return {
+        "mean": float(arr.mean()),
+        "lower": float(means[int(n * alpha / 2)]),
+        "upper": float(means[int(n * (1 - alpha / 2))]),
     }
 
 
