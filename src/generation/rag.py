@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.generation.llm import LoadedLLM, generate_answer, load_llm
+from src.generation.postprocess import snap_to_context_sentence
 from src.generation.prompts import (
     CITATION_STRICT_SYSTEM,
     DEFAULT_SYSTEM,
@@ -44,6 +45,8 @@ class RagResponse:
     retrieved: list[RetrievalResult]
     reranked: list[RetrievalResult] | None = None
     timing: dict[str, float] = field(default_factory=dict)
+    raw_answer: str | None = None        # pre-postprocess answer, when snap fired
+    snap_proxy: float | None = None      # top-1 sentence overlap / pred-token-count
 
 
 @dataclass
@@ -81,6 +84,11 @@ class RagPipeline:
     max_new_tokens: int = 256
     temperature: float = 0.0
     repetition_penalty: float = 1.2
+
+    # Post-processor: snap-to-context-sentence. See src/generation/postprocess.py.
+    # Empirically +0.015 F1 on top of off-shelf reranker at threshold 0.30.
+    use_snap_postprocessor: bool = True
+    snap_proxy_threshold: float = 0.30
 
     @classmethod
     def from_paths(
@@ -284,4 +292,27 @@ class RagPipeline:
         )
         timing["generate"] = round(time.time() - t2, 3)
 
-        return RagResponse(answer=answer_text, retrieved=retrieved, reranked=reranked, timing=timing)
+        # Snap post-processor — replace LLM paraphrase with the verbatim
+        # context sentence it most overlaps with (when overlap is high).
+        raw = None
+        proxy = None
+        if self.use_snap_postprocessor and passages_for_llm:
+            t3 = time.time()
+            snapped, proxy, fired = snap_to_context_sentence(
+                answer_text,
+                [r.text for r in passages_for_llm],
+                proxy_threshold=self.snap_proxy_threshold,
+            )
+            if fired:
+                raw = answer_text
+                answer_text = snapped
+            timing["postprocess"] = round(time.time() - t3, 3)
+
+        return RagResponse(
+            answer=answer_text,
+            retrieved=retrieved,
+            reranked=reranked,
+            timing=timing,
+            raw_answer=raw,
+            snap_proxy=proxy,
+        )
