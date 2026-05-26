@@ -37,7 +37,9 @@ from typing import Any
 from tqdm import tqdm
 
 from src.evaluation.metrics import (
+    bertscore,
     bootstrap_ci,
+    bootstrap_ci_scores,
     citation_accuracy,
     faithfulness_score,
     generation_metrics,
@@ -153,6 +155,9 @@ def run_benchmark(
     bootstrap_alpha: float = 0.05,
     save_predictions: bool = True,
     resume: bool = True,
+    compute_bertscore: bool = True,
+    bertscore_model: str = "bert-base-multilingual-cased",
+    bertscore_batch_size: int = 32,
 ) -> dict[str, Any]:
     """Run a benchmark through ``pipeline`` and write a metrics report.
 
@@ -163,6 +168,11 @@ def run_benchmark(
         bootstrap_iterations: Number of bootstrap resamples for 95% CIs.
         bootstrap_alpha: Alpha for CI (default 0.05 → 95% CI).
         save_predictions: Write per-question predictions to predictions.jsonl.
+        resume: Resume from existing predictions.jsonl if present (default True).
+        compute_bertscore: Compute BERTScore F1 + bootstrap CI. Loads a
+            multilingual BERT (~700 MB first run). Set False for fast iteration.
+        bertscore_model: Model id used for BERTScore embeddings.
+        bertscore_batch_size: Batch size for the BERTScore forward pass.
 
     Returns:
         The summary dict (also written to ``output_dir/summary.json``).
@@ -279,6 +289,40 @@ def run_benchmark(
                              n=bootstrap_iterations, alpha=bootstrap_alpha),
     ) or {"mean": point_f1, "lower": point_f1, "upper": point_f1}
 
+    # BERTScore F1 + bootstrap CI on per-question scores (cheaper than
+    # re-running BERT per resample). multilingual-BERT, lang='tr'.
+    bs_block: dict[str, Any] | None = None
+    if compute_bertscore:
+        bs = _safe(
+            "bertscore",
+            lambda: bertscore(
+                predictions, references,
+                model_type=bertscore_model,
+                lang="tr",
+                batch_size=bertscore_batch_size,
+            ),
+        )
+        if bs is not None:
+            bs_ci = _safe(
+                "bertscore_ci",
+                lambda: bootstrap_ci_scores(
+                    bs["per_question_f1"],
+                    n=bootstrap_iterations,
+                    alpha=bootstrap_alpha,
+                ),
+            ) or {"mean": bs["f1"], "lower": bs["f1"], "upper": bs["f1"]}
+            bs_block = {
+                "model": bertscore_model,
+                "precision": round(bs["precision"], 4),
+                "recall": round(bs["recall"], 4),
+                "f1": round(bs["f1"], 4),
+                "f1_95ci": {
+                    "point": round(bs["f1"], 4),
+                    "ci_low": round(bs_ci["lower"], 4),
+                    "ci_high": round(bs_ci["upper"], 4),
+                },
+            }
+
     summary = {
         "benchmark_path": str(benchmark_path),
         "n_questions": len(examples),
@@ -292,6 +336,7 @@ def run_benchmark(
             "system_prompt": pipeline.system_prompt[:120] + ("…" if len(pipeline.system_prompt) > 120 else ""),
         },
         "generation": gen,
+        "bertscore": bs_block,
         "faithfulness": faith,
         "citation": cite,
         "retrieval": ret,
@@ -333,6 +378,18 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
     ci = summary.get("token_f1_95ci") or {}
     if ci:
         lines.append(f"| token_f1 (bootstrap 95% CI) | {ci['point']:.4f} [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
+
+    bs = summary.get("bertscore")
+    if bs:
+        lines.extend(["", "## BERTScore", "", f"- **Model:** `{bs['model']}`", "",
+                      "| Metric | Value |", "|---|---|",
+                      f"| precision | {bs['precision']:.4f} |",
+                      f"| recall | {bs['recall']:.4f} |",
+                      f"| f1 | {bs['f1']:.4f} |"])
+        bsci = bs.get("f1_95ci") or {}
+        if bsci:
+            lines.append(f"| f1 (bootstrap 95% CI) | {bsci['point']:.4f} [{bsci['ci_low']:.4f}, {bsci['ci_high']:.4f}] |")
+
     _emit_section("Retrieval", summary.get("retrieval"))
     _emit_section("Faithfulness", summary.get("faithfulness"))
     _emit_section("Citation", summary.get("citation"))
