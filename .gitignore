@@ -5,9 +5,11 @@ CLAUDE.md
 # Data artifacts
 data/raw/
 data/processed/
+data/external/
 *.parquet
 *.pkl
 *.pickle
+*.jsonl
 
 # Model artifacts
 *.pt
@@ -58,3 +60,6 @@ professor_audio_transcription.txt
 # Misc
 *.log
 .cache/
+
+# Local handoff notes (not for git)
+reports/HANDOFF.md
