@@ -29,7 +29,7 @@ from src.reranker.cross_encoder import LoadedReranker, load_reranker, rerank
 from src.retrieval.bm25 import bm25_search, load_bm25_index
 from src.retrieval.dense import dense_search, load_embedding_model, load_faiss_index
 from src.retrieval.fusion import rrf_merge
-from src.retrieval.types import RetrievalResult
+from src.retrieval.types import RetrievalResult, infer_source
 
 if TYPE_CHECKING:
     import faiss
@@ -97,6 +97,12 @@ class RagPipeline:
     snap_proxy_threshold: float = 0.30
     snap_nli_threshold: float = 0.65
     snap_nli_prefilter_top_k: int = 5
+
+    # Sources whose passages are excluded from snap candidate selection.
+    # Yargıtay case-law text matches the statute-style gold poorly: phase3
+    # counterfactual showed dropping it recovers +0.0035 F1 (0.2351 -> 0.2386
+    # on our 225q gold). Set to an empty set to disable the filter.
+    snap_skip_sources: frozenset[str] = frozenset({"yargitay"})
 
     @classmethod
     def from_paths(
@@ -321,14 +327,24 @@ class RagPipeline:
         # Snap post-processor — replace LLM paraphrase with the verbatim
         # context sentence it most overlaps with. Routes through NLI if a
         # scorer is configured, else falls back to the token-overlap proxy.
+        # Source-filter the candidate pool first so case-law (Yargıtay) text
+        # doesn't poison snap routing: gold here is statute-style and snapping
+        # to a decision-style sentence rarely lines up.
         raw = None
         proxy_val: float | None = None
         nli_sim_val: float | None = None
         if self.use_snap_postprocessor and passages_for_llm:
             t3 = time.time()
+            if self.snap_skip_sources:
+                snap_candidates = [
+                    r for r in passages_for_llm
+                    if infer_source(r) not in self.snap_skip_sources
+                ]
+            else:
+                snap_candidates = passages_for_llm
             snapped, signals, fired = snap_route_decision(
                 answer_text,
-                [r.text for r in passages_for_llm],
+                [r.text for r in snap_candidates],
                 nli_scorer=self.nli_scorer,
                 proxy_threshold=self.snap_proxy_threshold,
                 sim_threshold=self.snap_nli_threshold,
