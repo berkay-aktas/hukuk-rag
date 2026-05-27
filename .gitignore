@@ -66,3 +66,6 @@ reports/HANDOFF.md
 reports/EXPERIMENTS.md
 reports/RETROSPECTIVE.md
 reports/c493_history_recovered.md
+
+# Audit backups (kept locally only)
+data/gold/*.pre_audit_backup
