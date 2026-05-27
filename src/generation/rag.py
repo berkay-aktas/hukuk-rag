@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from src.evaluation.nli import NLIScorer, load_nli_scorer
 from src.generation.llm import LoadedLLM, generate_answer, load_llm
-from src.generation.postprocess import snap_to_context_sentence
+from src.generation.postprocess import snap_route_decision
 from src.generation.prompts import (
     CITATION_STRICT_SYSTEM,
     DEFAULT_SYSTEM,
@@ -47,6 +48,7 @@ class RagResponse:
     timing: dict[str, float] = field(default_factory=dict)
     raw_answer: str | None = None        # pre-postprocess answer, when snap fired
     snap_proxy: float | None = None      # top-1 sentence overlap / pred-token-count
+    snap_nli_sim: float | None = None    # NLI similarity score, when nli router used
 
 
 @dataclass
@@ -68,6 +70,7 @@ class RagPipeline:
     embed_model: SentenceTransformer | None
     llm: LoadedLLM
     reranker: LoadedReranker | None = None
+    nli_scorer: NLIScorer | None = None
     system_prompt: str = DEFAULT_SYSTEM
 
     # Per-source retrieval depth — used as top-k for each individual source before RRF
@@ -86,9 +89,14 @@ class RagPipeline:
     repetition_penalty: float = 1.2
 
     # Post-processor: snap-to-context-sentence. See src/generation/postprocess.py.
-    # Empirically +0.015 F1 on top of off-shelf reranker at threshold 0.30.
+    # Empirically +0.015 F1 on top of off-shelf reranker at threshold 0.30
+    # (proxy-only router). When ``nli_scorer`` is set on this pipeline the
+    # NLI-gated router runs instead; default ``snap_nli_threshold=0.65`` is
+    # a reasonable starting point but should be swept per corpus.
     use_snap_postprocessor: bool = True
     snap_proxy_threshold: float = 0.30
+    snap_nli_threshold: float = 0.65
+    snap_nli_prefilter_top_k: int = 5
 
     @classmethod
     def from_paths(
@@ -102,6 +110,8 @@ class RagPipeline:
         use_reranker: bool = False,
         use_bm25: bool = True,
         use_faiss: bool = True,
+        use_nli_snap: bool = False,
+        nli_model: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM,
     ) -> RagPipeline:
         """Load a pipeline from one or more index bundle directories.
@@ -118,6 +128,10 @@ class RagPipeline:
             use_reranker: Whether to enable the reranker stage.
             use_bm25: Include BM25 in the first-stage retrieval.
             use_faiss: Include FAISS in the first-stage retrieval.
+            use_nli_snap: Load the Turkish NLI scorer and route the snap
+                post-processor through it instead of token-overlap proxy.
+            nli_model: Override the NLI sentence-transformer id. None = the
+                project's default ``emrecan/bert-base-turkish-cased-mean-nli-stsb-tr``.
             system_prompt: Which system prompt to use.
         """
         import json
@@ -171,12 +185,17 @@ class RagPipeline:
                 reranker_model if reranker_model else "seroe/bge-reranker-v2-m3-turkish-triplet"
             )
 
+        nli_scorer = None
+        if use_nli_snap:
+            nli_scorer = load_nli_scorer(nli_model) if nli_model else load_nli_scorer()
+
         return cls(
             dense_sources=dense_sources,
             bm25_sources=bm25_sources,
             embed_model=embed_model,
             llm=llm,
             reranker=reranker,
+            nli_scorer=nli_scorer,
             system_prompt=system_prompt,
         )
 
@@ -191,6 +210,8 @@ class RagPipeline:
         qlora_adapter: Path | str | None = None,
         reranker_model: Path | str | None = None,
         use_reranker: bool = False,
+        use_nli_snap: bool = False,
+        nli_model: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM,
     ) -> RagPipeline:
         """Load from EXPLICIT lists of faiss + bm25 paths.
@@ -212,12 +233,17 @@ class RagPipeline:
                 reranker_model if reranker_model else "seroe/bge-reranker-v2-m3-turkish-triplet"
             )
 
+        nli_scorer = None
+        if use_nli_snap:
+            nli_scorer = load_nli_scorer(nli_model) if nli_model else load_nli_scorer()
+
         return cls(
             dense_sources=dense_sources,
             bm25_sources=bm25_sources,
             embed_model=embed_model,
             llm=llm,
             reranker=reranker,
+            nli_scorer=nli_scorer,
             system_prompt=system_prompt,
         )
 
@@ -293,16 +319,23 @@ class RagPipeline:
         timing["generate"] = round(time.time() - t2, 3)
 
         # Snap post-processor — replace LLM paraphrase with the verbatim
-        # context sentence it most overlaps with (when overlap is high).
+        # context sentence it most overlaps with. Routes through NLI if a
+        # scorer is configured, else falls back to the token-overlap proxy.
         raw = None
-        proxy = None
+        proxy_val: float | None = None
+        nli_sim_val: float | None = None
         if self.use_snap_postprocessor and passages_for_llm:
             t3 = time.time()
-            snapped, proxy, fired = snap_to_context_sentence(
+            snapped, signals, fired = snap_route_decision(
                 answer_text,
                 [r.text for r in passages_for_llm],
+                nli_scorer=self.nli_scorer,
                 proxy_threshold=self.snap_proxy_threshold,
+                sim_threshold=self.snap_nli_threshold,
+                prefilter_top_k=self.snap_nli_prefilter_top_k,
             )
+            proxy_val = signals.get("proxy")
+            nli_sim_val = signals.get("nli_sim")
             if fired:
                 raw = answer_text
                 answer_text = snapped
@@ -314,5 +347,6 @@ class RagPipeline:
             reranked=reranked,
             timing=timing,
             raw_answer=raw,
-            snap_proxy=proxy,
+            snap_proxy=proxy_val,
+            snap_nli_sim=nli_sim_val,
         )
