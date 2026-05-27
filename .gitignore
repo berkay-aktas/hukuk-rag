@@ -63,3 +63,6 @@ professor_audio_transcription.txt
 
 # Local handoff notes (not for git)
 reports/HANDOFF.md
+reports/EXPERIMENTS.md
+reports/RETROSPECTIVE.md
+reports/c493_history_recovered.md
