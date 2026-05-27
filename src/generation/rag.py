@@ -104,6 +104,17 @@ class RagPipeline:
     # on our 225q gold). Set to an empty set to disable the filter.
     snap_skip_sources: frozenset[str] = frozenset({"yargitay"})
 
+    # HyDE: have the LLM draft a hypothetical answer and use that (plus the
+    # original question) as the dense retrieval query. BM25 still uses the
+    # original question. One extra LLM call per query.
+    use_hyde: bool = False
+
+    # Multi-query expansion: ask the LLM for ``multi_query_n`` paraphrases,
+    # run each through the retrievers, and RRF-fuse across all of them
+    # (plus the original). One extra LLM call per query, plus N searches.
+    use_multi_query: bool = False
+    multi_query_n: int = 3
+
     @classmethod
     def from_paths(
         cls,
@@ -254,17 +265,42 @@ class RagPipeline:
         )
 
     def retrieve(self, query: str) -> list[RetrievalResult]:
-        """First-stage retrieval: query every source, RRF-merge across all."""
+        """First-stage retrieval: query every source, RRF-merge across all.
+
+        With ``use_hyde=True`` the dense query becomes the LLM's hypothetical
+        answer (concatenated with the original question); BM25 still uses the
+        original question.
+
+        With ``use_multi_query=True`` the LLM generates ``multi_query_n``
+        paraphrases of the question. Each paraphrase + the original goes
+        through every retriever; all rankings are RRF-merged together.
+        """
+        from src.retrieval.hyde import generate_hypothetical_query
+        from src.retrieval.multi_query import generate_query_variants
+
         result_lists: list[list[RetrievalResult]] = []
 
-        if self.embed_model is not None:
-            for faiss_idx, mapping in self.dense_sources:
-                result_lists.append(
-                    dense_search(query, faiss_idx, mapping, self.embed_model, k=self.dense_top_k)
-                )
+        if self.use_multi_query:
+            queries = generate_query_variants(self.llm, query, n=self.multi_query_n)
+        else:
+            queries = [query]
 
-        for bm25_idx, mapping in self.bm25_sources:
-            result_lists.append(bm25_search(query, bm25_idx, mapping, k=self.bm25_top_k))
+        for q in queries:
+            dense_query = q
+            if self.use_hyde and self.embed_model is not None:
+                dense_query = generate_hypothetical_query(self.llm, q)
+
+            if self.embed_model is not None:
+                for faiss_idx, mapping in self.dense_sources:
+                    result_lists.append(
+                        dense_search(dense_query, faiss_idx, mapping, self.embed_model,
+                                     k=self.dense_top_k)
+                    )
+
+            for bm25_idx, mapping in self.bm25_sources:
+                # BM25 always uses the natural-language query, not the HyDE draft,
+                # because lexical search rewards keyword overlap with the question.
+                result_lists.append(bm25_search(q, bm25_idx, mapping, k=self.bm25_top_k))
 
         if not result_lists:
             raise RuntimeError("No retrievers enabled — load at least one FAISS or BM25 source.")
