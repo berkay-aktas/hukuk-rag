@@ -429,14 +429,56 @@ def _madde_header_re(art_no: int) -> re.Pattern[str]:
     return re.compile(rf"\bMadde\s+{art_no}\b", re.IGNORECASE)
 
 
+# Mevzuat scraping bookkeeping that appears inside chunk text after the
+# Madde header on some corpora (notably the Anayasa PDFs). Without stripping,
+# the body extractor's first-N-sentences cap lands inside these metadata
+# lines for short articles, returning bookkeeping instead of legal prose.
+# Empirically: 11/16 citation-snap regressions on Phase 6 were caused by
+# this pattern (Anayasa 15, 146, etc.). See EXPERIMENTS.md Experiment 11.
+_MEVZUAT_METADATA_LINE = re.compile(
+    r"^[ \t]*(?:Kaynak satır sayısı|doğrulama notu taşıyan satır sayısı)\s*[:：][^\n]*\n?",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Chunk continuation marker — appears in Yargıtay PDF chunks where one
+# Madde spans multiple pages (e.g., "Madde 91 - Gözaltı (devam)"). When
+# the body extractor lands on a continuation chunk, it misses the article
+# opener that contains the gold-relevant fıkra. Detection is best-effort.
+_CONTINUATION_MARKER = re.compile(r"\((?:devam|devamı)\)", re.IGNORECASE)
+
+
+def _is_continuation_chunk(chunk_text: str, art_no: int) -> bool:
+    """Heuristic: does ``Madde N`` in this chunk look like a continuation?"""
+    m = _madde_header_re(art_no).search(chunk_text)
+    if not m:
+        return False
+    # Look ±60 chars around the Madde header for the (devam) marker.
+    window = chunk_text[max(0, m.start() - 60):min(len(chunk_text), m.end() + 60)]
+    return bool(_CONTINUATION_MARKER.search(window))
+
+
 def _extract_madde_body(chunk_text: str, art_no: int) -> str | None:
     """Return the body of Article ``art_no`` from a statute chunk.
 
     Locates ``Madde {art_no}`` in the chunk and extracts text from there
     up to the next ``Madde N`` marker (or end of chunk, whichever comes
-    first). Trims long bodies to ~2 sentences / 400 chars so the snap
-    doesn't dump an entire 1000-char chunk into the answer.
+    first). Trims long bodies to ~3 sentences / 500 chars so the snap
+    doesn't dump an entire 1000-char chunk into the answer, but is large
+    enough to absorb a one-line title + an opening prose sentence.
+
+    Two pre-processing passes guard against known failure modes:
+
+    1. Strip mevzuat metadata lines (``Kaynak satır sayısı: …``,
+       ``doğrulama notu taşıyan satır sayısı: …``). Without this, short
+       Anayasa articles have the bookkeeping show up as the "first
+       sentence" of the body — see Experiment 11 in EXPERIMENTS.md.
+    2. The 3-sentence/500-char cap is wider than the previous 2/400 so
+       that an em-dash title sentence (``Madde 15 — Temel hak ve
+       hürriyetlerin kullanılması…``) plus the actual prose opener
+       fits in a single snap target.
     """
+    chunk_text = _MEVZUAT_METADATA_LINE.sub("", chunk_text)
+
     m = _madde_header_re(art_no).search(chunk_text)
     if not m:
         return None
@@ -447,13 +489,17 @@ def _extract_madde_body(chunk_text: str, art_no: int) -> str | None:
     end = m.end() + next_madde.start() if next_madde else len(chunk_text)
     body = chunk_text[start:end].strip()
 
-    # Cap to first 2 sentences. Reuses the same sentence splitter as the
-    # other snap routers for consistency.
+    # Collapse multi-blank runs left by stripped metadata lines.
+    body = re.sub(r"\n\s*\n+", "\n", body).strip()
+
+    # Cap to first 3 sentences. One sentence is often just the em-dash
+    # title (``Madde 15 — Temel hak ve hürriyetlerin durdurulması.``);
+    # the gold-matching prose usually lives in the next 1-2 sentences.
     sents = _SENT_SPLIT.split(body)
-    if len(sents) > 2:
-        body = " ".join(sents[:2]).strip()
-    if len(body) > 400:
-        body = body[:400].rstrip() + "…"
+    if len(sents) > 3:
+        body = " ".join(sents[:3]).strip()
+    if len(body) > 500:
+        body = body[:500].rstrip() + "…"
     return body
 
 
@@ -469,6 +515,12 @@ def find_grounded_madde(
     Returns ``None`` if no chunk satisfies both conditions — the citation is
     not grounded and we should not snap.
 
+    Two-pass preference: when multiple chunks for the same Madde are in
+    retrieval (common for long articles split across PDF pages), prefer the
+    chunk WITHOUT a ``(devam)`` continuation marker — that one contains the
+    article opener (fıkra 1), which is almost always the gold-relevant text.
+    Fall back to continuation chunks only if no opener is in retrieval.
+
     The grounding check is what makes citation-snap safer than blind
     citation-to-text substitution: a hallucinated citation (LLM cites a
     statute that's not in retrieval) produces a ``None`` here and the LLM's
@@ -476,9 +528,18 @@ def find_grounded_madde(
     """
     if not retrieved_texts or code == "?":
         return None
-    for chunk_text in retrieved_texts:
-        if not _chunk_matches_code(chunk_text, code):
+
+    matching = [t for t in retrieved_texts if _chunk_matches_code(t, code)]
+    # First pass: skip continuation chunks ("Madde 91 ... (devam)")
+    for chunk_text in matching:
+        if _is_continuation_chunk(chunk_text, art_no):
             continue
+        body = _extract_madde_body(chunk_text, art_no)
+        if body:
+            return body
+    # Fallback: if every matching chunk is a continuation, accept one
+    # rather than miss the snap entirely.
+    for chunk_text in matching:
         body = _extract_madde_body(chunk_text, art_no)
         if body:
             return body
