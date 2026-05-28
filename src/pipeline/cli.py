@@ -27,6 +27,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,14 +65,27 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--questions", required=True, help="Path to benchmark file (json/jsonl).")
     p_bench.add_argument("--indexes", required=True, help="Path to index bundle directory.")
     p_bench.add_argument("--report", required=True, help="Output report directory.")
-    p_bench.add_argument("--variant", choices=["base", "ft", "ft+rerank"], default="ft",
-                         help="Which model variant. base=vanilla Qwen, ft=QLoRA, ft+rerank=QLoRA+cross-encoder.")
+    p_bench.add_argument("--variant", choices=["base", "ft", "ft+rerank", "prod"], default="ft",
+                         help="Model variant. base=vanilla Qwen; ft=QLoRA; ft+rerank=QLoRA+reranker; "
+                              "prod=production headline (off-shelf reranker + snap + rep_penalty 1.0, NO QLoRA). "
+                              "Choose the LLM with --llm-base (e.g. Qwen/Qwen2.5-14B-Instruct).")
     p_bench.add_argument("--qlora-adapter", help="Path to QLoRA adapter dir (required for ft/ft+rerank).")
     p_bench.add_argument("--llm-base", default="Qwen/Qwen2.5-7B-Instruct")
     p_bench.add_argument("--reranker", help="Reranker model id or path (default: off-shelf bge-reranker-turkish).")
     p_bench.add_argument("--prompt", default="default",
                          choices=["default", "short", "strict_citation", "mcq"])
     p_bench.add_argument("--bootstrap-n", type=int, default=1000)
+    p_bench.add_argument("--rep-penalty", type=float, default=None,
+                         help="Override repetition_penalty. The 'prod' variant defaults it to 1.0 "
+                              "(base Qwen-14B at 1.2 derails into CJK on legal contexts).")
+    p_bench.add_argument("--final-top-k", type=int, default=None,
+                         help="Passages sent to the LLM after rerank (default: pipeline default).")
+    p_bench.add_argument("--max-new-tokens", type=int, default=None)
+    p_bench.add_argument("--no-snap", action="store_true",
+                         help="Disable the sentence-snap postprocessor.")
+    p_bench.add_argument("--no-llm", action="store_true",
+                         help="Retrieval-only: skip generation, report retrieval metrics only. "
+                              "Runs without a GPU; generation metrics are reported as skipped.")
 
     # query
     p_query = subparsers.add_parser("query", help="Run one ad-hoc question.")
@@ -79,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
     p_query.add_argument("--indexes", required=True, help="Path to index bundle directory.")
     p_query.add_argument("--qlora-adapter", help="Optional QLoRA adapter path.")
     p_query.add_argument("--use-reranker", action="store_true")
+    p_query.add_argument("--rep-penalty", type=float, default=1.0,
+                         help="repetition_penalty for generation. Default 1.0 (base-LLM safe; "
+                              "1.2 can derail base Qwen-14B into CJK on legal contexts).")
     p_query.add_argument("--show-passages", action="store_true",
                          help="Print retrieved passages alongside the answer.")
 
@@ -124,11 +141,29 @@ def _cmd_benchmark(args) -> int:
         "mcq": MCQ_SYSTEM,
     }
 
-    use_reranker = args.variant.endswith("+rerank")
-    qlora = args.qlora_adapter if args.variant != "base" else None
-    if args.variant != "base" and not args.qlora_adapter:
+    is_prod = args.variant == "prod"
+    use_reranker = is_prod or args.variant.endswith("+rerank")
+    qlora = args.qlora_adapter if args.variant in ("ft", "ft+rerank") else None
+    if args.variant in ("ft", "ft+rerank") and not args.qlora_adapter:
         print("WARNING: --variant ft/ft+rerank set but --qlora-adapter not provided — using base Qwen.",
               file=sys.stderr)
+
+    # Assemble dataclass overrides. 'prod' = production headline config: off-shelf
+    # reranker + source-filtered sentence-snap + repetition_penalty 1.0, NO QLoRA.
+    overrides: dict[str, Any] = {}
+    if is_prod:
+        overrides["repetition_penalty"] = 1.0
+        overrides["use_snap_postprocessor"] = True
+        overrides["snap_skip_sources"] = frozenset({"yargitay"})
+    # Explicit flags win over the preset.
+    if args.rep_penalty is not None:
+        overrides["repetition_penalty"] = args.rep_penalty
+    if args.final_top_k is not None:
+        overrides["final_top_k"] = args.final_top_k
+    if args.max_new_tokens is not None:
+        overrides["max_new_tokens"] = args.max_new_tokens
+    if args.no_snap:
+        overrides["use_snap_postprocessor"] = False
 
     pipeline = RagPipeline.from_paths(
         index_dir=args.indexes,
@@ -137,19 +172,26 @@ def _cmd_benchmark(args) -> int:
         reranker_model=args.reranker,
         use_reranker=use_reranker,
         system_prompt=prompt_map[args.prompt],
+        load_llm=not args.no_llm,
+        **overrides,
     )
 
     summary = run_benchmark(
         pipeline=pipeline,
         benchmark_path=args.questions,
         output_dir=args.report,
+        no_llm=args.no_llm,
         bootstrap_iterations=args.bootstrap_n,
     )
     print(f"\nDone. Report: {Path(args.report).resolve()}")
-    print(f"  Token F1: {summary['generation']['token_f1']:.4f} "
-          f"[95% CI {summary['token_f1_95ci']['ci_low']:.4f}, {summary['token_f1_95ci']['ci_high']:.4f}]")
+    if summary.get("generation"):
+        print(f"  Token F1: {summary['generation']['token_f1']:.4f} "
+              f"[95% CI {summary['token_f1_95ci']['ci_low']:.4f}, {summary['token_f1_95ci']['ci_high']:.4f}]")
+    elif summary.get("generation_skipped"):
+        print("  Generation: SKIPPED (--no-llm, retrieval-only)")
     if summary.get("retrieval"):
-        print(f"  Recall@10: {summary['retrieval']['recall@10']:.4f}, MRR: {summary['retrieval']['mrr']:.4f}")
+        print(f"  Recall@10: {summary['retrieval']['recall@10']:.4f} "
+              f"({summary.get('retrieval_granularity')}), MRR: {summary['retrieval']['mrr']:.4f}")
     return 0
 
 
@@ -160,6 +202,7 @@ def _cmd_query(args) -> int:
         index_dir=args.indexes,
         qlora_adapter=args.qlora_adapter,
         use_reranker=args.use_reranker,
+        repetition_penalty=args.rep_penalty,
     )
     resp = pipeline.answer(args.question)
     print("\n" + "=" * 72)
