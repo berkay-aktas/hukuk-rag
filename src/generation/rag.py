@@ -49,6 +49,8 @@ class RagResponse:
     raw_answer: str | None = None        # pre-postprocess answer, when snap fired
     snap_proxy: float | None = None      # top-1 sentence overlap / pred-token-count
     snap_nli_sim: float | None = None    # NLI similarity score, when nli router used
+    snap_kind: str | None = None         # which snap router fired: "citation" | "sentence" | None
+    extracted_citations: list[tuple[str, int]] | None = None  # (code, art_no) pairs found in LLM output
 
 
 @dataclass
@@ -103,6 +105,18 @@ class RagPipeline:
     # counterfactual showed dropping it recovers +0.0035 F1 (0.2351 -> 0.2386
     # on our 225q gold). Set to an empty set to disable the filter.
     snap_skip_sources: frozenset[str] = frozenset({"yargitay"})
+
+    # Citation-extraction snap router. When the LLM emits an explicit
+    # statute-and-article citation (e.g. "TCK Madde 81"), look up the
+    # cited article in retrieved chunks and snap to its verbatim body.
+    # Stronger signal than token overlap; routed under ``citation_precedence``.
+    use_citation_snap: bool = False
+    # "citation_first" — citation-snap takes precedence; sentence-snap is the
+    #   fallback when no grounded citation is found.
+    # "sentence_first" — sentence-snap first; citation as fallback.
+    # "citation_only" — citation-snap only; no sentence router.
+    # "sentence_only" — equivalent to use_citation_snap=False.
+    citation_precedence: str = "citation_first"
 
     # HyDE: have the LLM draft a hypothetical answer and use that (plus the
     # original question) as the dense retrieval query. BM25 still uses the
@@ -363,12 +377,17 @@ class RagPipeline:
         # Snap post-processor — replace LLM paraphrase with the verbatim
         # context sentence it most overlaps with. Routes through NLI if a
         # scorer is configured, else falls back to the token-overlap proxy.
+        # When ``use_citation_snap`` is on, also extracts explicit statute
+        # citations (e.g. "TCK Madde 81") and snaps to the cited madde body
+        # if it's grounded in retrieval.
         # Source-filter the candidate pool first so case-law (Yargıtay) text
         # doesn't poison snap routing: gold here is statute-style and snapping
         # to a decision-style sentence rarely lines up.
         raw = None
         proxy_val: float | None = None
         nli_sim_val: float | None = None
+        snap_kind: str | None = None
+        citations: list[tuple[str, int]] | None = None
         if self.use_snap_postprocessor and passages_for_llm:
             t3 = time.time()
             if self.snap_skip_sources:
@@ -385,12 +404,23 @@ class RagPipeline:
                 proxy_threshold=self.snap_proxy_threshold,
                 sim_threshold=self.snap_nli_threshold,
                 prefilter_top_k=self.snap_nli_prefilter_top_k,
+                use_citation_snap=self.use_citation_snap,
+                citation_precedence=self.citation_precedence,
             )
             proxy_val = signals.get("proxy")
             nli_sim_val = signals.get("nli_sim")
+            cit_fired_flag = signals.get("citation_fired", 0.0) > 0.5
             if fired:
                 raw = answer_text
                 answer_text = snapped
+                snap_kind = "citation" if cit_fired_flag else "sentence"
+            # Always surface citation extractions for inspection — useful when
+            # snap didn't fire but the LLM did emit a citation pattern.
+            if signals.get("citations_n", 0.0) > 0:
+                # We don't return the raw citations list from snap_route_decision
+                # — re-extract here so the response is self-contained. Cheap.
+                from src.generation.postprocess import extract_citations
+                citations = extract_citations(answer_text if raw is None else raw)
             timing["postprocess"] = round(time.time() - t3, 3)
 
         return RagResponse(
@@ -401,4 +431,6 @@ class RagPipeline:
             raw_answer=raw,
             snap_proxy=proxy_val,
             snap_nli_sim=nli_sim_val,
+            snap_kind=snap_kind,
+            extracted_citations=citations,
         )
