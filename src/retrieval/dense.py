@@ -33,6 +33,7 @@ def build_faiss_index(
     m: int = 32,
     nbits: int = 8,
     seed: int = 42,
+    flat_threshold: int = 1000,
 ) -> tuple[faiss.Index, list[dict[str, Any]]]:
     """Build a FAISS IVF-PQ index from chunks.
 
@@ -45,6 +46,10 @@ def build_faiss_index(
         m: Number of sub-quantizers for PQ.
         nbits: Bits per sub-quantizer.
         seed: Random seed for reproducible IVF training sample.
+        flat_threshold: Below this many chunks, build an exact IndexFlatIP
+            (no training) instead of IVF-PQ. Keeps ingest robust on the small
+            corpora an evaluator may bring; IVF-PQ(m=32, nbits=8) is unstable
+            and warns on tiny inputs.
 
     Returns:
         Tuple of (FAISS index, chunk mapping list).
@@ -67,17 +72,28 @@ def build_faiss_index(
     embeddings = embeddings.astype(np.float32)
 
     dim = embeddings.shape[1]
-    logger.info(f"Building FAISS IVF-PQ index (dim={dim}, nlist={nlist}, m={m})...")
 
-    quantizer = _faiss.IndexFlatIP(dim)
-    index = _faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits)
+    # Tiny-corpus fallback: IVF-PQ needs a representative training sample and
+    # PQ(m=32, nbits=8) is unstable / warns on very small corpora. Below the
+    # threshold use a brute-force IndexFlatIP (exact, no training) so ingest
+    # stays robust on the small corpora an evaluator may bring.
+    if len(embeddings) < flat_threshold:
+        logger.warning(
+            "Corpus has %d vectors (< %d) — using exact IndexFlatIP instead of IVF-PQ.",
+            len(embeddings), flat_threshold,
+        )
+        index = _faiss.IndexFlatIP(dim)
+        index.add(embeddings)
+    else:
+        logger.info(f"Building FAISS IVF-PQ index (dim={dim}, nlist={nlist}, m={m})...")
+        quantizer = _faiss.IndexFlatIP(dim)
+        index = _faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits)
+        rng = np.random.RandomState(seed)
+        train_size = min(len(embeddings), nlist * 40)
+        train_indices = rng.choice(len(embeddings), train_size, replace=False)
+        index.train(embeddings[train_indices])
+        index.add(embeddings)
 
-    rng = np.random.RandomState(seed)
-    train_size = min(len(embeddings), nlist * 40)
-    train_indices = rng.choice(len(embeddings), train_size, replace=False)
-    index.train(embeddings[train_indices])
-
-    index.add(embeddings)
     logger.info(f"Index built: {index.ntotal} vectors")
 
     chunk_mapping = _build_chunk_mapping(chunks)
@@ -141,7 +157,9 @@ def dense_search(
     Returns:
         List of RetrievalResult sorted by score descending.
     """
-    index.nprobe = nprobe
+    # IndexFlatIP (tiny-corpus fallback) has no nprobe; only IVF indexes do.
+    if hasattr(index, "nprobe"):
+        index.nprobe = nprobe
 
     query_embedding = model.encode(
         [f"query: {query}"],
