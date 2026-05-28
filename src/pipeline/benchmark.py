@@ -394,9 +394,22 @@ def run_benchmark(
     ret: dict[str, float] | None = None
     retrieval_granularity: str | None = None
     if any(relevant_ids):
+        def _dedupe(seq: list[str]) -> list[str]:
+            # Order-preserving dedupe. Doc-level keys repeat (many chunks → one
+            # doc), which would double-count in rank metrics (MRR/nDCG > 1.0);
+            # ranking is over DISTINCT docs in first-appearance order. No-op for
+            # chunk-ids (already unique).
+            seen: set[str] = set()
+            out: list[str] = []
+            for x in seq:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
         rel_nonempty = [rel for rel in relevant_ids if rel]
         chunk_ret = [r for r, rel in zip(retrieved_ids, relevant_ids) if rel]
-        doc_ret = [d for d, rel in zip(retrieved_doc_keys, relevant_ids) if rel]
+        doc_ret = [_dedupe(d) for d, rel in zip(retrieved_doc_keys, relevant_ids) if rel]
 
         def _has_signal(retr: list[list[str]]) -> bool:
             return any(set(r) & set(rel) for r, rel in zip(retr, rel_nonempty))

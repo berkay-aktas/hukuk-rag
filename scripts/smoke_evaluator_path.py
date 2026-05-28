@@ -128,10 +128,16 @@ def main() -> int:
         assert summary.get("generation_skipped") is True, "no-llm mode not honored"
         gran = summary.get("retrieval_granularity")
         assert gran == "doc", f"expected doc-level recall, got granularity={gran!r}"
-        recall10 = (summary.get("retrieval") or {}).get("recall@10")
+        ret = summary.get("retrieval") or {}
+        recall10 = ret.get("recall@10")
         assert recall10 and recall10 > 0.0, f"doc-level recall@10 is {recall10!r} (expected > 0)"
+        # Rank metrics must be in [0,1] — guards the doc-key dedupe (repeated
+        # doc-keys would inflate MRR/nDCG above 1.0).
+        for k in ("recall@5", "recall@10", "mrr", "ndcg@10"):
+            v = ret.get(k)
+            assert v is not None and 0.0 <= v <= 1.0, f"{k} out of [0,1]: {v!r}"
         print(f"  retrieval: granularity={gran}  recall@10={recall10:.3f}  "
-              f"recall@5={summary['retrieval'].get('recall@5'):.3f}  mrr={summary['retrieval'].get('mrr'):.3f}")
+              f"recall@5={ret.get('recall@5'):.3f}  mrr={ret.get('mrr'):.3f}  ndcg@10={ret.get('ndcg@10'):.3f}")
 
     print("PASS")
     return 0
