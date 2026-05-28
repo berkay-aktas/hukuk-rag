@@ -366,6 +366,15 @@ def main(argv: list[str] | None = None) -> None:
                    help="Sources to exclude from snap candidates (repeatable).")
     p.add_argument("--bootstrap-n", type=int, default=1000,
                    help="Bootstrap resamples for the per-rule F1 CI.")
+    p.add_argument(
+        "--write-snapped-predictions",
+        choices=["baseline", "sentence_only", "citation_only",
+                 "citation_first", "sentence_first", "oracle"],
+        default=None,
+        help="Also write a predictions.jsonl in benchmark format with this "
+             "rule's snapped answer as predicted_answer. Feeds directly into "
+             "score_with_llm_judge.py without further re-formatting.",
+    )
     args = p.parse_args(argv)
 
     if not args.mapping and not args.corpus:
@@ -403,6 +412,47 @@ def main(argv: list[str] | None = None) -> None:
         for rec in summary["per_question"]:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     logger.info("Wrote %s (%d records)", per_q_path, len(summary["per_question"]))
+
+    # Emit a benchmark-format predictions.jsonl for the requested rule so
+    # downstream tools (score_with_llm_judge.py, BERTScore re-runs, manual
+    # inspection) can consume it without reformatting. We re-read the
+    # source predictions.jsonl to preserve every field (retrieved_chunk_ids,
+    # question, metadata) and just swap predicted_answer.
+    if args.write_snapped_predictions:
+        snap_path = args.out / f"predictions_{args.write_snapped_predictions}.jsonl"
+        rule = args.write_snapped_predictions
+        with open(snap_path, "w", encoding="utf-8") as f:
+            for src_rec, q_rec in zip(predictions, summary["per_question"]):
+                # Pick the snapped value for this rule
+                if rule == "baseline":
+                    snapped = q_rec["base"]
+                elif rule == "sentence_only":
+                    snapped = q_rec["sentence_snap"] or q_rec["base"]
+                elif rule == "citation_only":
+                    snapped = q_rec["citation_snap"] or q_rec["base"]
+                elif rule == "citation_first":
+                    snapped = q_rec["citation_snap"] or q_rec["sentence_snap"] or q_rec["base"]
+                elif rule == "sentence_first":
+                    snapped = q_rec["sentence_snap"] or q_rec["citation_snap"] or q_rec["base"]
+                elif rule == "oracle":
+                    # Pick the candidate whose F1 was the highest for this q.
+                    candidates = [
+                        ("base", q_rec["base"], q_rec["base_f1"]),
+                        ("citation", q_rec["citation_snap"] or q_rec["base"], q_rec["citation_only_f1"]),
+                        ("sentence", q_rec["sentence_snap"] or q_rec["base"], q_rec["sentence_only_f1"]),
+                    ]
+                    _, snapped, _ = max(candidates, key=lambda c: c[2])
+                else:
+                    snapped = q_rec["base"]
+                out_rec = dict(src_rec)
+                out_rec["predicted_answer"] = snapped
+                out_rec["snap_kind"] = (
+                    "citation" if snapped == q_rec.get("citation_snap")
+                    else "sentence" if snapped == q_rec.get("sentence_snap")
+                    else None
+                )
+                f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+        logger.info("Wrote %s (%d records, rule=%s)", snap_path, len(predictions), rule)
 
 
 if __name__ == "__main__":
