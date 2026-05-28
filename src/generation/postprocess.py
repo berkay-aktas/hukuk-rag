@@ -1,6 +1,6 @@
 """Post-generation rewrites applied to the LLM's raw answer before scoring.
 
-Two snap routers are shipped:
+Three snap routers are shipped:
 
 1. :func:`snap_to_context_sentence` — the original proxy-only router. Uses
    token-overlap fraction between the LLM answer and each candidate sentence
@@ -10,6 +10,13 @@ Two snap routers are shipped:
    LLM is paraphrasing a specific context sentence. Closes false negatives
    (heavy paraphrase, low token overlap, high semantic similarity) that the
    proxy-only router misses.
+3. :func:`snap_to_cited_madde` — citation-extraction router. Parses the LLM
+   answer for explicit statute-and-article citations (e.g. ``TCK Madde 81``,
+   ``Anayasa'nın 90. maddesi``). When the cited article is also present in
+   the retrieved passages and the chunk's text matches the cited statute
+   code, replaces the LLM answer with the verbatim article body. A grounded
+   citation is a stronger signal of LLM intent than token overlap; this
+   router takes precedence over (1) by default when both fire.
 
 Why snap at all:
 
@@ -35,7 +42,9 @@ oracle max(base, snap-k1, snap-k2)                            0.2861
 The 0.30 token-overlap threshold dominated 0.40 and 0.50 in offline sweep.
 The NLI-gated router targets the gap between 0.2386 and 0.2861 by snapping
 on questions where the LLM paraphrased so heavily that token overlap missed
-the signal.
+the signal. The citation router targets the same gap from a different angle:
+it fires on explicit grounded citations regardless of paraphrase strength,
+which makes it complementary to (1) and (2) rather than redundant.
 """
 
 from __future__ import annotations
@@ -202,6 +211,319 @@ def snap_to_context_sentence_nli(
     return chosen, best_sim, True
 
 
+# ---------------------------------------------------------------------------
+# Citation-extraction snap router
+# ---------------------------------------------------------------------------
+
+# Canonical statute codes used in Turkish legal text. Each canonical key maps
+# to the surface forms (abbreviations, full names, numbered law refs) that
+# may appear in either the LLM's answer or a retrieved chunk's text. We need
+# both for routing: the LLM's emission tells us *which* code is being cited,
+# and the chunk's text tells us *whether* a retrieved passage matches that
+# code — without the second check, a "Madde 5" mention in the answer could
+# wrongly snap to any code's Article 5 in retrieval.
+#
+# Only codes that appear in our 3-corpus retrieval are listed. Anayasa is
+# included even though the Constitution PDF is among the 7 missing statutes
+# (HANDOFF.md) — when retrieval brings in an Anayasa reference indirectly
+# (e.g. through Yargıtay decisions citing it) we still want the alias known.
+_STATUTE_ALIASES: dict[str, tuple[str, ...]] = {
+    "TCK": (
+        "TCK", "T.C.K.", "Türk Ceza Kanunu", "Türk Ceza Kanununun",
+        "Ceza Kanunu", "5237 sayılı",
+    ),
+    "TBK": (
+        "TBK", "T.B.K.", "Türk Borçlar Kanunu", "Türk Borçlar Kanununun",
+        "Borçlar Kanunu", "6098 sayılı",
+    ),
+    "TMK": (
+        "TMK", "T.M.K.", "Türk Medeni Kanunu", "Türk Medeni Kanununun",
+        "Medeni Kanun", "4721 sayılı",
+    ),
+    "TTK": (
+        "TTK", "T.T.K.", "Türk Ticaret Kanunu", "Türk Ticaret Kanununun",
+        "Ticaret Kanunu", "6102 sayılı",
+    ),
+    "CMK": (
+        "CMK", "C.M.K.", "Ceza Muhakemesi Kanunu", "Ceza Muhakemesi Kanununun",
+        "5271 sayılı",
+    ),
+    "HMK": (
+        "HMK", "H.M.K.", "Hukuk Muhakemeleri Kanunu", "Hukuk Muhakemeleri Kanununun",
+        "6100 sayılı",
+    ),
+    "İYUK": (
+        "İYUK", "IYUK", "İdari Yargılama Usulü Kanunu", "İdari Yargılama Usulü Kanununun",
+        "2577 sayılı",
+    ),
+    "Anayasa": (
+        "Anayasa", "Anayasa'nın", "Anayasanın",
+        "Türkiye Cumhuriyeti Anayasası",
+    ),
+    "İK": (
+        "İK", "İş Kanunu", "İş Kanununun", "4857 sayılı",
+    ),
+    "TKHK": (
+        "TKHK", "Tüketicinin Korunması Hakkında Kanun", "6502 sayılı",
+    ),
+}
+
+# Backref: alias surface (lowercased) → canonical code key.
+_ALIAS_TO_CODE: dict[str, str] = {
+    a.lower(): code for code, aliases in _STATUTE_ALIASES.items() for a in aliases
+}
+
+# Sort aliases by length descending so the longest match wins (e.g.,
+# "Türk Ceza Kanununun" should match before "Ceza Kanunu" before "TCK").
+_ALIAS_RE = re.compile(
+    "|".join(
+        re.escape(a)
+        for a in sorted(_ALIAS_TO_CODE.keys(), key=len, reverse=True)
+    ),
+    re.IGNORECASE,
+)
+
+# Madde-N forward syntax: "Madde 81", "MADDE 81", "M. 81", "m. 81", "Md. 81".
+# Captures the article number as group(1). A trailing /N or -X paragraph
+# specifier is matched but discarded (we snap to the whole article, not the
+# sub-paragraph — the chunked passage typically contains the full Madde).
+_MADDE_FORWARD_RE = re.compile(
+    r"\b(?:madde|m\.|md\.|MD\.)\s*(\d{1,4})(?:[/.\-](?:\d+|[A-Za-z]))?\b",
+    re.IGNORECASE,
+)
+
+# Reverse syntax: "81. madde", "81. maddesi", "47/5. maddesi", "90'ıncı madde".
+# Article number is group(1); we tolerate the genitive/ordinal suffix.
+_MADDE_REVERSE_RE = re.compile(
+    r"\b(\d{1,4})(?:[/.\-](?:\d+|[A-Za-z]))?[.'’]?\s*(?:inci|ıncı|uncu|üncü|nci|ncı)?\s*madde(?:sinde|sine|sinin|si|nin|ye|ne|de|dir)?\b",
+    re.IGNORECASE,
+)
+
+# How wide a window (in characters) around a Madde-N match to scan for a
+# statute alias. Tighter than a sentence — we want the alias adjacent to
+# the article, not just somewhere nearby. ±60 covers the longest realistic
+# verbatim form ("Türk Borçlar Kanununun 1023. maddesi") plus parenthesised
+# abbreviations, without bleeding into adjacent legal clauses.
+_CODE_ATTRIBUTION_WINDOW = 60
+
+# False-positive guard: the alias "Anayasa" matches inside "Anayasa Mahkemesi"
+# (Constitutional Court, a separate entity referenced by law 6216 — not the
+# Constitution itself). We require the next short window after the alias
+# match to NOT mention "Mahkeme" / "Mahkemesi" before accepting "Anayasa".
+_AYM_DISAMBIGUATION_WINDOW = 25
+
+
+def _resolve_alias_code(window: str, alias_global_start: int) -> str | None:
+    """Walk the window's alias matches and return the canonical code, or None
+    if attribution is ambiguous.
+
+    "Ambiguous" means more than one *distinct* canonical code is mentioned in
+    the window. A repeated mention of the same code is not ambiguous. The
+    AYM-disambiguation guard runs here too: "Anayasa" followed by "Mahkeme"
+    within ``_AYM_DISAMBIGUATION_WINDOW`` chars is rejected as a code match.
+    """
+    codes_found: list[str] = []
+    for alias_m in _ALIAS_RE.finditer(window):
+        matched = alias_m.group(0).lower()
+        if matched == "anayasa":
+            after = window[alias_m.end():alias_m.end() + _AYM_DISAMBIGUATION_WINDOW]
+            if "mahkeme" in after.lower():
+                continue
+        code = _ALIAS_TO_CODE[matched]
+        if not codes_found or codes_found[-1] != code:
+            codes_found.append(code)
+
+    distinct = set(codes_found)
+    if len(distinct) == 1:
+        return next(iter(distinct))
+    return None  # zero matches OR multiple distinct codes both treated as "?"
+
+
+def extract_citations(text: str) -> list[tuple[str, int]]:
+    """Pull ``(canonical_code, article_no)`` pairs from LLM-produced text.
+
+    Two-pass attribution:
+
+    1. Every Madde-N match (forward or reverse syntax) gets a ±60 char
+       window scanned for a recognizable statute alias. The window must
+       contain exactly one *distinct* canonical code for the citation to
+       be attributed; multi-code windows mark the citation as ``"?"``.
+    2. If no alias is found in the window, the citation is left unattributed
+       (code ``"?"``). If exactly one distinct code is present in the whole
+       answer, all unattributed citations are reassigned to it. Otherwise
+       they are dropped — bare ``"Madde 345"`` with multiple codes elsewhere
+       is too ambiguous to ground safely.
+
+    Returns deduplicated citations in first-occurrence order. An empty list
+    means the answer either has no Madde-N mention or none could be
+    attributed unambiguously.
+    """
+    if not text:
+        return []
+
+    # Collect (article_no, code, match_start) candidates from both syntaxes.
+    raw: list[tuple[int, str, int]] = []
+    for pattern in (_MADDE_FORWARD_RE, _MADDE_REVERSE_RE):
+        for m in pattern.finditer(text):
+            try:
+                art_no = int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            if not (1 <= art_no <= 9999):
+                continue
+            win_start = max(0, m.start() - _CODE_ATTRIBUTION_WINDOW)
+            win_end = min(len(text), m.end() + _CODE_ATTRIBUTION_WINDOW)
+            code = _resolve_alias_code(text[win_start:win_end], win_start) or "?"
+            raw.append((art_no, code, m.start()))
+
+    if not raw:
+        return []
+
+    # Fallback attribution: if exactly one code appears anywhere in the
+    # text, attribute unattributed citations to it. Otherwise drop them.
+    distinct_codes = {code for _, code, _ in raw if code != "?"}
+    if len(distinct_codes) == 1:
+        sole = next(iter(distinct_codes))
+        raw = [(n, sole if c == "?" else c, pos) for n, c, pos in raw]
+    else:
+        raw = [(n, c, pos) for n, c, pos in raw if c != "?"]
+
+    # Dedupe (code, art_no) while preserving first-occurrence order.
+    seen: set[tuple[str, int]] = set()
+    out: list[tuple[str, int]] = []
+    for n, c, _ in sorted(raw, key=lambda t: t[2]):
+        key = (c, n)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _chunk_matches_code(chunk_text: str, code: str) -> bool:
+    """True if the chunk text mentions any alias of the given canonical code.
+
+    We scan the head of the chunk first (statute markers typically appear in
+    the chunk's title or first paragraph), then fall back to the whole text.
+    Lowercased substring match — robust to case and formatting variations.
+    """
+    if not chunk_text:
+        return False
+    aliases = _STATUTE_ALIASES.get(code, ())
+    head = chunk_text[:1200].lower()
+    for alias in aliases:
+        if alias.lower() in head:
+            return True
+    if len(chunk_text) > 1200:
+        tail = chunk_text[1200:].lower()
+        for alias in aliases:
+            if alias.lower() in tail:
+                return True
+    return False
+
+
+# Regex used inside chunk text to locate the "Madde N" header. Note this
+# differs from _MADDE_FORWARD_RE: chunk text uses the canonical "Madde N"
+# form (no abbreviation variants), so we don't accept "m. N" here — that
+# would match too aggressively in dense statute prose.
+def _madde_header_re(art_no: int) -> re.Pattern[str]:
+    return re.compile(rf"\bMadde\s+{art_no}\b", re.IGNORECASE)
+
+
+def _extract_madde_body(chunk_text: str, art_no: int) -> str | None:
+    """Return the body of Article ``art_no`` from a statute chunk.
+
+    Locates ``Madde {art_no}`` in the chunk and extracts text from there
+    up to the next ``Madde N`` marker (or end of chunk, whichever comes
+    first). Trims long bodies to ~2 sentences / 400 chars so the snap
+    doesn't dump an entire 1000-char chunk into the answer.
+    """
+    m = _madde_header_re(art_no).search(chunk_text)
+    if not m:
+        return None
+
+    start = m.start()
+    rest = chunk_text[m.end():]
+    next_madde = re.search(r"\bMadde\s+\d+\b", rest, re.IGNORECASE)
+    end = m.end() + next_madde.start() if next_madde else len(chunk_text)
+    body = chunk_text[start:end].strip()
+
+    # Cap to first 2 sentences. Reuses the same sentence splitter as the
+    # other snap routers for consistency.
+    sents = _SENT_SPLIT.split(body)
+    if len(sents) > 2:
+        body = " ".join(sents[:2]).strip()
+    if len(body) > 400:
+        body = body[:400].rstrip() + "…"
+    return body
+
+
+def find_grounded_madde(
+    code: str,
+    art_no: int,
+    retrieved_texts: list[str],
+) -> str | None:
+    """Find the verbatim body of ``(code, art_no)`` in retrieved passages.
+
+    Returns the article body if a retrieved chunk both (a) matches the
+    requested statute code and (b) contains a ``Madde {art_no}`` header.
+    Returns ``None`` if no chunk satisfies both conditions — the citation is
+    not grounded and we should not snap.
+
+    The grounding check is what makes citation-snap safer than blind
+    citation-to-text substitution: a hallucinated citation (LLM cites a
+    statute that's not in retrieval) produces a ``None`` here and the LLM's
+    original answer is preserved.
+    """
+    if not retrieved_texts or code == "?":
+        return None
+    for chunk_text in retrieved_texts:
+        if not _chunk_matches_code(chunk_text, code):
+            continue
+        body = _extract_madde_body(chunk_text, art_no)
+        if body:
+            return body
+    return None
+
+
+def snap_to_cited_madde(
+    llm_answer: str,
+    retrieved_texts: list[str],
+) -> tuple[str, list[tuple[str, int]], bool]:
+    """Replace the LLM answer with a grounded madde body when one is cited.
+
+    Walks the citations extracted from ``llm_answer`` in occurrence order.
+    The first citation that resolves to a grounded chunk wins — subsequent
+    citations are still returned in the citation list (for logging) but do
+    not trigger additional snaps.
+
+    Returns ``(final_answer, extracted_citations, was_snapped)``. The
+    citation list is returned even when no snap fired, which is useful for
+    inspection: it tells us whether the LLM cited anything at all.
+    """
+    if not retrieved_texts:
+        return llm_answer, [], False
+
+    citations = extract_citations(llm_answer)
+    if not citations:
+        return llm_answer, [], False
+
+    for code, art_no in citations:
+        body = find_grounded_madde(code, art_no, retrieved_texts)
+        if body:
+            return body, citations, True
+
+    return llm_answer, citations, False
+
+
+# ---------------------------------------------------------------------------
+# Unified router — picks among proxy-only / NLI-gated / citation snap.
+# ---------------------------------------------------------------------------
+
+# Precedence rules for combining citation-snap with sentence-snap. Used both
+# at inference (RagPipeline) and in the offline counterfactual sweep.
+CitationPrecedence = str  # "citation_first" | "sentence_first" | "citation_only" | "sentence_only"
+
+
 def snap_route_decision(
     llm_answer: str,
     retrieved_texts: list[str],
@@ -211,32 +533,82 @@ def snap_route_decision(
     sim_threshold: float = 0.65,
     prefilter_top_k: int = 5,
     top_k_sentences: int = 1,
+    use_citation_snap: bool = False,
+    citation_precedence: CitationPrecedence = "citation_first",
 ) -> tuple[str, dict[str, float], bool]:
-    """Single entrypoint that picks proxy-only or NLI-gated routing.
+    """Single entrypoint that picks among citation, proxy, or NLI snap routing.
 
-    When ``nli_scorer`` is None, behaves identically to
-    :func:`snap_to_context_sentence` with the given ``proxy_threshold``.
-    When ``nli_scorer`` is provided, uses :func:`snap_to_context_sentence_nli`.
+    When ``use_citation_snap=True``, citation-snap may fire (or not) according
+    to ``citation_precedence``:
+
+    * ``"citation_first"`` — try citation-snap first; if it doesn't fire,
+      fall through to the sentence router (proxy or NLI).
+    * ``"sentence_first"`` — try the sentence router first; if it doesn't
+      fire, fall through to citation-snap.
+    * ``"citation_only"`` — try citation-snap and stop (no sentence router).
+    * ``"sentence_only"`` — disable citation-snap entirely; equivalent to
+      ``use_citation_snap=False``.
+
+    When ``use_citation_snap=False`` (default), behaves identically to the
+    previous proxy/NLI-only routing, preserving backward-compatible behaviour
+    for the production C3 configuration.
 
     Returns ``(answer, signals, was_snapped)`` where ``signals`` contains
     whichever routing scores were actually computed — useful for the
-    counterfactual script which wants to log both signals when sweeping.
+    counterfactual script which wants to log all signals when sweeping.
+    The signals dict may include ``proxy``, ``nli_sim``, ``citation_fired``,
+    ``citations`` depending on which routers ran.
     """
-    if nli_scorer is None:
-        answer, proxy, fired = snap_to_context_sentence(
+    signals: dict[str, float] = {}
+
+    def _run_sentence() -> tuple[str, bool]:
+        if nli_scorer is None:
+            ans, proxy, fired = snap_to_context_sentence(
+                llm_answer,
+                retrieved_texts,
+                proxy_threshold=proxy_threshold,
+                top_k_sentences=top_k_sentences,
+            )
+            signals["proxy"] = float(proxy)
+            return ans, fired
+
+        ans, sim, fired = snap_to_context_sentence_nli(
             llm_answer,
             retrieved_texts,
-            proxy_threshold=proxy_threshold,
+            nli_scorer,
+            sim_threshold=sim_threshold,
+            prefilter_top_k=prefilter_top_k,
             top_k_sentences=top_k_sentences,
         )
-        return answer, {"proxy": float(proxy)}, fired
+        signals["nli_sim"] = float(sim)
+        return ans, fired
 
-    answer, sim, fired = snap_to_context_sentence_nli(
-        llm_answer,
-        retrieved_texts,
-        nli_scorer,
-        sim_threshold=sim_threshold,
-        prefilter_top_k=prefilter_top_k,
-        top_k_sentences=top_k_sentences,
-    )
-    return answer, {"nli_sim": float(sim)}, fired
+    def _run_citation() -> tuple[str, bool]:
+        ans, cits, fired = snap_to_cited_madde(llm_answer, retrieved_texts)
+        signals["citation_fired"] = 1.0 if fired else 0.0
+        signals["citations_n"] = float(len(cits))
+        return ans, fired
+
+    if not use_citation_snap or citation_precedence == "sentence_only":
+        ans, fired = _run_sentence()
+        return ans, signals, fired
+
+    if citation_precedence == "citation_only":
+        ans, fired = _run_citation()
+        return ans, signals, fired
+
+    if citation_precedence == "citation_first":
+        cit_ans, cit_fired = _run_citation()
+        if cit_fired:
+            return cit_ans, signals, True
+        sent_ans, sent_fired = _run_sentence()
+        return sent_ans, signals, sent_fired
+
+    if citation_precedence == "sentence_first":
+        sent_ans, sent_fired = _run_sentence()
+        if sent_fired:
+            return sent_ans, signals, True
+        cit_ans, cit_fired = _run_citation()
+        return cit_ans, signals, cit_fired
+
+    raise ValueError(f"Unknown citation_precedence: {citation_precedence!r}")
