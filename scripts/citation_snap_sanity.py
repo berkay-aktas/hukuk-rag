@@ -71,6 +71,43 @@ AYM_90_CHUNK = (
     "onaylamayı bir kanunla uygun bulmasına bağlıdır."
 )
 
+# Phase 6 regression case (gold_test_set_00131): Anayasa 15 chunk in
+# the mevzuat_ft corpus has a metadata-line preamble between the title
+# and the actual article body. Pre-fix, the body extractor returned the
+# title + metadata; post-fix, the metadata should be stripped and the
+# extractor should reach the prose.
+AYM_15_WITH_METADATA = (
+    "Madde 15 — Temel hak ve hürriyetlerin kullanılmasının durdurulması.\n"
+    "Kaynak satır sayısı: 13; doğrulama notu taşıyan satır sayısı: 6.\n"
+    "Savaş, seferberlik veya olağanüstü hallerde milletlerarası hukuktan "
+    "doğan yükümlülükler ihlal edilmemek kaydıyla, durumun gerektirdiği "
+    "ölçüde temel hak ve hürriyetlerin kullanılması kısmen veya tamamen "
+    "durdurulabilir veya bunlar için Anayasada öngörülen güvencelere aykırı "
+    "tedbirler alınabilir."
+)
+
+# Phase 6 regression case (gold_test_set_00024): CMK 91 is split across
+# pages, so retrieval brings BOTH the article opener (containing the
+# gold-relevant 24-saat rule in fıkra 1) AND a continuation chunk for
+# fıkra 5 (Cumhuriyet savcısı yazılı emrine itiraz). The continuation
+# chunk is marked "(devam)" and the body extractor must prefer the opener.
+CMK_91_OPENER = (
+    "5271 sayılı Ceza Muhakemesi Kanunu — Gözaltı\n"
+    "Madde 91- (1) Yukarıdaki maddeye göre yakalanan kişi, Cumhuriyet "
+    "Savcılığınca bırakılmazsa, soruşturmanın tamamlanması için "
+    "gözaltına alınmasına karar verilebilir. Gözaltı süresi, yakalama "
+    "yerine en yakın hâkim veya mahkemeye gönderilmesi için zorunlu "
+    "süre hariç, yakalama anından itibaren yirmidört saati geçemez."
+)
+CMK_91_CONTINUATION = (
+    "5271 sayılı Ceza Muhakemesi Kanunu\n"
+    "Madde 91 - Gözaltı (devam)\n"
+    "(5) Yakalama işlemine, gözaltına alma ve gözaltı süresinin "
+    "uzatılmasına ilişkin Cumhuriyet savcısının yazılı emrine karşı, "
+    "yakalanan kişi, müdafii veya kanunî temsilcisi sulh ceza hâkimliğine "
+    "başvurabilir."
+)
+
 UNRELATED_YARGITAY = (
     "Yargıtay 9. Hukuk Dairesi 2023/4567 E., 2024/123 K. — Davacı işveren "
     "iş sözleşmesinin haklı nedenle feshini ileri sürmüştür. Yerel mahkeme "
@@ -228,6 +265,34 @@ def test_find_grounded_madde() -> list[bool]:
     results.append(_check(
         "Anayasa Madde 90 grounded",
         body is not None and "milletlerarası" in body.lower(),
+        details=f"body={body!r}",
+    ))
+
+    # Phase 6 regression fix: Anayasa 15 chunk has Kaynak satır sayısı
+    # metadata between title and prose. The body extractor MUST strip it.
+    body = find_grounded_madde("Anayasa", 15, [AYM_15_WITH_METADATA])
+    results.append(_check(
+        "Anayasa Madde 15 — metadata stripped, prose reached",
+        body is not None and "savaş" in body.lower() and "kaynak satır" not in body.lower(),
+        details=f"body={body!r}",
+    ))
+
+    # Phase 6 regression fix: CMK 91 has both opener and continuation
+    # chunks in retrieval. find_grounded_madde must prefer the opener
+    # (24-saat rule) over the continuation (yazılı emir itirazı).
+    body = find_grounded_madde("CMK", 91, [CMK_91_CONTINUATION, CMK_91_OPENER])
+    results.append(_check(
+        "CMK Madde 91 — opener chosen over continuation",
+        body is not None and "yirmidört saati" in body.lower(),
+        details=f"body={body!r}",
+    ))
+
+    # Fallback: when only a continuation chunk is in retrieval, take it
+    # rather than miss the snap entirely.
+    body = find_grounded_madde("CMK", 91, [CMK_91_CONTINUATION])
+    results.append(_check(
+        "CMK Madde 91 — fall back to continuation when no opener",
+        body is not None and ("yazılı" in body.lower() or "devam" in body.lower()),
         details=f"body={body!r}",
     ))
 
