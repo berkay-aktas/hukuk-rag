@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.evaluation.nli import NLIScorer, load_nli_scorer
-from src.generation.llm import LoadedLLM, generate_answer, load_llm
+from src.generation.llm import LoadedLLM, generate_answer, load_llm as _load_llm
 from src.generation.postprocess import snap_route_decision
 from src.generation.prompts import (
     CITATION_STRICT_SYSTEM,
@@ -70,7 +70,7 @@ class RagPipeline:
     dense_sources: list[tuple[Any, list[dict[str, Any]]]]
     bm25_sources: list[tuple[Any, list[dict[str, Any]]]]
     embed_model: SentenceTransformer | None
-    llm: LoadedLLM
+    llm: LoadedLLM | None = None
     reranker: LoadedReranker | None = None
     nli_scorer: NLIScorer | None = None
     system_prompt: str = DEFAULT_SYSTEM
@@ -144,6 +144,8 @@ class RagPipeline:
         use_nli_snap: bool = False,
         nli_model: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM,
+        load_llm: bool = True,
+        **pipeline_overrides: Any,
     ) -> RagPipeline:
         """Load a pipeline from one or more index bundle directories.
 
@@ -164,6 +166,13 @@ class RagPipeline:
             nli_model: Override the NLI sentence-transformer id. None = the
                 project's default ``emrecan/bert-base-turkish-cased-mean-nli-stsb-tr``.
             system_prompt: Which system prompt to use.
+            load_llm: When False, skip loading the LLM (``llm`` stays None).
+                Used for GPU-free retrieval-only runs (e.g. the ``--no-llm``
+                benchmark mode and the Mac smoke test).
+            **pipeline_overrides: Any :class:`RagPipeline` dataclass field
+                (``repetition_penalty``, ``final_top_k``, ``max_new_tokens``,
+                ``use_snap_postprocessor``, ``snap_skip_sources``, …) forwarded
+                straight to the constructor. Invalid names raise ``TypeError``.
         """
         import json
 
@@ -208,7 +217,7 @@ class RagPipeline:
                 f"No faiss.index or bm25.pkl found in any of: {[str(d) for d in index_dirs]}"
             )
 
-        llm = load_llm(base_model=llm_base_model, adapter_path=qlora_adapter)
+        llm = _load_llm(base_model=llm_base_model, adapter_path=qlora_adapter) if load_llm else None
 
         reranker = None
         if use_reranker:
@@ -228,6 +237,7 @@ class RagPipeline:
             reranker=reranker,
             nli_scorer=nli_scorer,
             system_prompt=system_prompt,
+            **pipeline_overrides,
         )
 
     @classmethod
@@ -244,6 +254,7 @@ class RagPipeline:
         use_nli_snap: bool = False,
         nli_model: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM,
+        load_llm: bool = True,
     ) -> RagPipeline:
         """Load from EXPLICIT lists of faiss + bm25 paths.
 
@@ -252,12 +263,14 @@ class RagPipeline:
         Yargıtay layout where faiss is faiss_ft.index and bm25 is bm25.pkl
         in a sibling directory). Each path must have a matching .mapping.pkl
         sibling for the FAISS case.
+
+        Set ``load_llm=False`` to skip loading the LLM (retrieval-only runs).
         """
         dense_sources = [load_faiss_index(Path(p)) for p in dense_index_paths]
         bm25_sources = [load_bm25_index(Path(p)) for p in bm25_index_paths]
 
         embed_model = load_embedding_model(embedding_model) if dense_sources else None
-        llm = load_llm(base_model=llm_base_model, adapter_path=qlora_adapter)
+        llm = _load_llm(base_model=llm_base_model, adapter_path=qlora_adapter) if load_llm else None
         reranker = None
         if use_reranker:
             reranker = load_reranker(
@@ -323,6 +336,38 @@ class RagPipeline:
             return result_lists[0]
 
         return rrf_merge(*result_lists, k=self.rrf_k)
+
+    def retrieve_only(self, question: str) -> RagResponse:
+        """Retrieve (+rerank) for a question WITHOUT calling the LLM.
+
+        Mirrors the retrieval half of :meth:`answer` — same first-stage
+        retrieval and the same reranker stage — but skips generation entirely,
+        so it runs without a GPU / without a loaded LLM. ``answer`` is returned
+        as an empty string. Used by the ``--no-llm`` benchmark mode for GPU-free
+        retrieval sanity checks and cheap Recall@k computation.
+
+        Args:
+            question: The user question.
+
+        Returns:
+            A :class:`RagResponse` with ``answer=""``, populated ``retrieved``
+            and (when a reranker is configured) ``reranked`` plus ``timing``.
+        """
+        import time
+
+        timing: dict[str, float] = {}
+        t0 = time.time()
+        retrieved = self.retrieve(question)
+        timing["retrieve"] = round(time.time() - t0, 3)
+
+        reranked = None
+        if self.reranker is not None and retrieved:
+            t1 = time.time()
+            candidates = retrieved[: max(self.rerank_top_k, self.final_top_k * 3)]
+            reranked = rerank(self.reranker, question, candidates, top_k=self.final_top_k)
+            timing["rerank"] = round(time.time() - t1, 3)
+
+        return RagResponse(answer="", retrieved=retrieved, reranked=reranked, timing=timing)
 
     def answer(
         self,
