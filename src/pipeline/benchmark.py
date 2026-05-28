@@ -47,6 +47,7 @@ from src.evaluation.metrics import (
     token_f1,
 )
 from src.generation.rag import RagPipeline
+from src.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
 
@@ -92,17 +93,24 @@ def load_benchmark(path: Path | str) -> list[BenchmarkExample]:
 def _normalize_example(rec: dict[str, Any], fallback_id_prefix: str, idx: int) -> BenchmarkExample:
     """Coerce one record from any supported schema into BenchmarkExample."""
     qid = rec.get("question_id") or rec.get("query_id") or rec.get("id") or f"{fallback_id_prefix}_{idx:05d}"
-    question = rec.get("question") or rec.get("query")
+    question = rec.get("question") or rec.get("query") or rec.get("soru")
     if not question:
         raise ValueError(f"Record {qid} has no question/query field")
 
-    # Answer field aliases (in priority order)
+    # Answer field aliases (in priority order). Turkish + common English aliases
+    # are appended AFTER the existing keys so prior schemas are unaffected.
     gold = (
         rec.get("gold_answer")
         or rec.get("verified_answer")
         or rec.get("gold_answer_extract")
         or rec.get("answer")
         or rec.get("expected_response")
+        or rec.get("cevap")
+        or rec.get("cevap_metni")
+        or rec.get("ground_truth")
+        or rec.get("reference_answer")
+        or rec.get("reference")
+        or rec.get("expected")
         or ""
     )
 
@@ -120,6 +128,16 @@ def _normalize_example(rec: dict[str, Any], fallback_id_prefix: str, idx: int) -
                     gold_chunks.append(str(cid))
             elif isinstance(src, str):
                 gold_chunks.append(src)
+    else:
+        # Doc-level labels (filenames / doc-ids). Matched against doc-keys in
+        # run_benchmark when they don't intersect chunk-ids — see
+        # retrieval_granularity. Accepts a single string or a list.
+        for key in ("gold_doc_ids", "ilgili_belgeler", "kaynaklar",
+                    "gold_docs", "relevant_docs", "relevant_documents"):
+            if rec.get(key):
+                vals = rec[key]
+                gold_chunks = [str(x) for x in vals] if isinstance(vals, list) else [str(vals)]
+                break
 
     # Options for MCQ
     options = None
@@ -131,9 +149,12 @@ def _normalize_example(rec: dict[str, Any], fallback_id_prefix: str, idx: int) -
             options = [rec["options"][k] for k in ("A", "B", "C", "D", "E") if k in rec["options"]]
 
     metadata = {k: v for k, v in rec.items() if k not in (
-        "question_id", "query_id", "id", "question", "query",
+        "question_id", "query_id", "id", "question", "query", "soru",
         "gold_answer", "verified_answer", "gold_answer_extract", "answer", "expected_response",
+        "cevap", "cevap_metni", "ground_truth", "reference_answer", "reference", "expected",
         "gold_chunk_ids", "gold_sources", "options",
+        "gold_doc_ids", "ilgili_belgeler", "kaynaklar", "gold_docs",
+        "relevant_docs", "relevant_documents",
     )}
 
     return BenchmarkExample(
@@ -146,11 +167,38 @@ def _normalize_example(rec: dict[str, Any], fallback_id_prefix: str, idx: int) -
     )
 
 
+def _doc_key(result: RetrievalResult) -> str:
+    """Best-effort document-level identity for a retrieved chunk.
+
+    Preference order: explicit ``doc_id``, then ``parent_doc_id``, then the
+    basename of ``source_file``, then the chunk's own id as a last resort. Used
+    for doc-level Recall@k when a benchmark labels relevance by document
+    (filename / doc-id) rather than by chunk-id — the common case for an
+    evaluator's custom corpus, where chunk-ids are freshly minted UUIDs.
+
+    Args:
+        result: A retrieval result whose ``metadata`` may carry doc identifiers.
+
+    Returns:
+        A string doc-key suitable for set-intersection against gold labels.
+    """
+    md = result.metadata or {}
+    if md.get("doc_id"):
+        return str(md["doc_id"])
+    if md.get("parent_doc_id"):
+        return str(md["parent_doc_id"])
+    sf = md.get("source_file")
+    if sf:
+        return Path(str(sf)).name
+    return result.chunk_id
+
+
 def run_benchmark(
     pipeline: RagPipeline,
     benchmark_path: Path | str,
     output_dir: Path | str,
     *,
+    no_llm: bool = False,
     bootstrap_iterations: int = 1000,
     bootstrap_alpha: float = 0.05,
     save_predictions: bool = True,
@@ -165,6 +213,10 @@ def run_benchmark(
         pipeline: A :class:`RagPipeline` instance.
         benchmark_path: Path to a benchmark file (see module docstring for schemas).
         output_dir: Directory to write predictions + summary into. Created if missing.
+        no_llm: Retrieval-only mode — skip LLM generation and report retrieval
+            metrics only. Generation/faithfulness/citation/BERTScore are reported
+            as empty and ``generation_skipped=True`` is set so absent metrics are
+            never mistaken for a real 0.0. Runs without a GPU.
         bootstrap_iterations: Number of bootstrap resamples for 95% CIs.
         bootstrap_alpha: Alpha for CI (default 0.05 → 95% CI).
         save_predictions: Write per-question predictions to predictions.jsonl.
@@ -186,6 +238,7 @@ def run_benchmark(
     predictions: list[str] = []
     references: list[str] = []
     retrieved_ids: list[list[str]] = []
+    retrieved_doc_keys: list[list[str]] = []
     relevant_ids: list[list[str]] = []
     contexts_joined: list[str] = []   # one string per prediction (passages joined)
     per_question_records: list[dict[str, Any]] = []
@@ -206,6 +259,7 @@ def run_benchmark(
                     predictions.append(rec["predicted_answer"])
                     references.append(rec["gold_answer"])
                     retrieved_ids.append(rec["retrieved_chunk_ids"])
+                    retrieved_doc_keys.append(rec.get("retrieved_doc_keys") or [])
                     relevant_ids.append(rec.get("gold_chunk_ids") or [])
                     contexts_joined.append("")  # not stored per-record; faithfulness will be re-computed
                     per_question_records.append(rec)
@@ -218,7 +272,11 @@ def run_benchmark(
         if ex.question_id in completed_qids:
             continue
         try:
-            resp = pipeline.answer(ex.question, options=ex.options)
+            resp = (
+                pipeline.retrieve_only(ex.question)
+                if no_llm
+                else pipeline.answer(ex.question, options=ex.options)
+            )
         except Exception as e:
             logger.warning("Question %s failed: %s", ex.question_id, e)
             resp = None
@@ -236,7 +294,10 @@ def run_benchmark(
 
         predictions.append(pred)
         references.append(ex.gold_answer)
-        retrieved_ids.append([r.chunk_id for r in retrieved])
+        # Recall is scored on what the system actually surfaces (the post-rerank
+        # top-k = reranked), aligned with the persisted retrieved_chunk_ids.
+        retrieved_ids.append([r.chunk_id for r in reranked])
+        retrieved_doc_keys.append([_doc_key(r) for r in reranked])
         relevant_ids.append(ex.gold_chunk_ids or [])
         contexts_joined.append("\n\n".join(r.text for r in reranked))
 
@@ -246,6 +307,7 @@ def run_benchmark(
             "gold_answer": ex.gold_answer,
             "predicted_answer": pred,
             "retrieved_chunk_ids": [r.chunk_id for r in reranked],
+            "retrieved_doc_keys": [_doc_key(r) for r in reranked],
             "retrieved_scores": [round(r.score, 4) for r in reranked],
             "gold_chunk_ids": ex.gold_chunk_ids,
             "timing": timing,
@@ -268,60 +330,90 @@ def run_benchmark(
             logger.warning("Aggregate metric %s failed: %s", label, e)
             return None
 
-    gen = _safe("generation", lambda: generation_metrics(predictions, references)) or {}
-    faith_score = _safe("faithfulness", lambda: faithfulness_score(predictions, contexts_joined))
-    faith = {"token_overlap": faith_score} if faith_score is not None else {}
-    cite = _safe("citation", lambda: citation_accuracy(predictions, num_passages=pipeline.final_top_k)) or {}
-
-    # Retrieval metrics — only if we have any chunk-level labels
-    ret: dict[str, float] | None = None
-    if any(relevant_ids):
-        filtered_ret = [r for r, rel in zip(retrieved_ids, relevant_ids) if rel]
-        filtered_rel = [rel for rel in relevant_ids if rel]
-        ret = _safe("retrieval", lambda: retrieval_metrics(filtered_ret, filtered_rel))
-
-    # Bootstrap CIs on Token F1
-    f1_per_q = [token_f1([p], [r]) for p, r in zip(predictions, references)]
-    point_f1 = sum(f1_per_q) / len(f1_per_q) if f1_per_q else 0.0
-    boot = _safe(
-        "bootstrap",
-        lambda: bootstrap_ci(token_f1, predictions, references,
-                             n=bootstrap_iterations, alpha=bootstrap_alpha),
-    ) or {"mean": point_f1, "lower": point_f1, "upper": point_f1}
-
-    # BERTScore F1 + bootstrap CI on per-question scores (cheaper than
-    # re-running BERT per resample). multilingual-BERT, lang='tr'.
+    # Generation-side metrics. Skipped entirely in --no-llm (retrieval-only)
+    # mode so absent metrics are never mistaken for a real 0.0 — see the
+    # generation_skipped flag in the summary.
     bs_block: dict[str, Any] | None = None
-    if compute_bertscore:
-        bs = _safe(
-            "bertscore",
-            lambda: bertscore(
-                predictions, references,
-                model_type=bertscore_model,
-                lang="tr",
-                batch_size=bertscore_batch_size,
-            ),
-        )
-        if bs is not None:
-            bs_ci = _safe(
-                "bertscore_ci",
-                lambda: bootstrap_ci_scores(
-                    bs["per_question_f1"],
-                    n=bootstrap_iterations,
-                    alpha=bootstrap_alpha,
+    if no_llm:
+        gen, faith, cite = {}, {}, {}
+        point_f1 = 0.0
+        boot = {"mean": 0.0, "lower": 0.0, "upper": 0.0}
+    else:
+        gen = _safe("generation", lambda: generation_metrics(predictions, references)) or {}
+        faith_score = _safe("faithfulness", lambda: faithfulness_score(predictions, contexts_joined))
+        faith = {"token_overlap": faith_score} if faith_score is not None else {}
+        cite = _safe("citation", lambda: citation_accuracy(predictions, num_passages=pipeline.final_top_k)) or {}
+
+        # Bootstrap CIs on Token F1
+        f1_per_q = [token_f1([p], [r]) for p, r in zip(predictions, references)]
+        point_f1 = sum(f1_per_q) / len(f1_per_q) if f1_per_q else 0.0
+        boot = _safe(
+            "bootstrap",
+            lambda: bootstrap_ci(token_f1, predictions, references,
+                                 n=bootstrap_iterations, alpha=bootstrap_alpha),
+        ) or {"mean": point_f1, "lower": point_f1, "upper": point_f1}
+
+        # BERTScore F1 + bootstrap CI on per-question scores (cheaper than
+        # re-running BERT per resample). multilingual-BERT, lang='tr'.
+        if compute_bertscore:
+            bs = _safe(
+                "bertscore",
+                lambda: bertscore(
+                    predictions, references,
+                    model_type=bertscore_model,
+                    lang="tr",
+                    batch_size=bertscore_batch_size,
                 ),
-            ) or {"mean": bs["f1"], "lower": bs["f1"], "upper": bs["f1"]}
-            bs_block = {
-                "model": bertscore_model,
-                "precision": round(bs["precision"], 4),
-                "recall": round(bs["recall"], 4),
-                "f1": round(bs["f1"], 4),
-                "f1_95ci": {
-                    "point": round(bs["f1"], 4),
-                    "ci_low": round(bs_ci["lower"], 4),
-                    "ci_high": round(bs_ci["upper"], 4),
-                },
-            }
+            )
+            if bs is not None:
+                bs_ci = _safe(
+                    "bertscore_ci",
+                    lambda: bootstrap_ci_scores(
+                        bs["per_question_f1"],
+                        n=bootstrap_iterations,
+                        alpha=bootstrap_alpha,
+                    ),
+                ) or {"mean": bs["f1"], "lower": bs["f1"], "upper": bs["f1"]}
+                bs_block = {
+                    "model": bertscore_model,
+                    "precision": round(bs["precision"], 4),
+                    "recall": round(bs["recall"], 4),
+                    "f1": round(bs["f1"], 4),
+                    "f1_95ci": {
+                        "point": round(bs["f1"], 4),
+                        "ci_low": round(bs_ci["lower"], 4),
+                        "ci_high": round(bs_ci["upper"], 4),
+                    },
+                }
+
+    # Retrieval metrics — auto-select granularity (runs in both modes). If gold
+    # ids intersect retrieved CHUNK ids, score at chunk level; else if they
+    # intersect retrieved DOC keys, score at doc level (an evaluator's "relevant
+    # documents" labels are filenames/doc-ids, never our random chunk UUIDs).
+    # If neither matches, omit + warn rather than report 0 against the wrong keys.
+    ret: dict[str, float] | None = None
+    retrieval_granularity: str | None = None
+    if any(relevant_ids):
+        rel_nonempty = [rel for rel in relevant_ids if rel]
+        chunk_ret = [r for r, rel in zip(retrieved_ids, relevant_ids) if rel]
+        doc_ret = [d for d, rel in zip(retrieved_doc_keys, relevant_ids) if rel]
+
+        def _has_signal(retr: list[list[str]]) -> bool:
+            return any(set(r) & set(rel) for r, rel in zip(retr, rel_nonempty))
+
+        if _has_signal(chunk_ret):
+            retrieval_granularity = "chunk"
+            ret = _safe("retrieval", lambda: retrieval_metrics(chunk_ret, rel_nonempty))
+        elif _has_signal(doc_ret):
+            retrieval_granularity = "doc"
+            ret = _safe("retrieval", lambda: retrieval_metrics(doc_ret, rel_nonempty))
+        else:
+            retrieval_granularity = "none (gold labels matched neither chunk-ids nor doc-keys)"
+            logger.warning(
+                "Retrieval gold labels intersect neither chunk-ids nor doc-keys; "
+                "retrieval metrics omitted. Check that doc labels (e.g. 'ilgili_belgeler') "
+                "match ingested filenames/doc_ids."
+            )
 
     summary = {
         "benchmark_path": str(benchmark_path),
@@ -330,16 +422,18 @@ def run_benchmark(
         "mean_seconds_per_q": round(total_seconds / max(1, len(examples)), 2),
         "pipeline": {
             "embedding_model": getattr(pipeline.embed_model, "model_card_data", None) and pipeline.embed_model.model_card_data.base_model or "unknown",
-            "llm_base": pipeline.llm.base_model_id,
-            "qlora_adapter": pipeline.llm.adapter_path,
+            "llm_base": pipeline.llm.base_model_id if pipeline.llm else None,
+            "qlora_adapter": pipeline.llm.adapter_path if pipeline.llm else None,
             "reranker": pipeline.reranker.model_id if pipeline.reranker else None,
             "system_prompt": pipeline.system_prompt[:120] + ("…" if len(pipeline.system_prompt) > 120 else ""),
         },
+        "generation_skipped": no_llm,
         "generation": gen,
         "bertscore": bs_block,
         "faithfulness": faith,
         "citation": cite,
         "retrieval": ret,
+        "retrieval_granularity": retrieval_granularity,
         "token_f1_95ci": {"point": round(point_f1, 4), "ci_low": round(boot["lower"], 4), "ci_high": round(boot["upper"], 4)},
     }
 
@@ -363,7 +457,7 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
         f"- **Benchmark:** `{summary['benchmark_path']}`",
         f"- **Questions:** {summary['n_questions']}",
         f"- **Total time:** {summary['total_seconds']}s ({summary['mean_seconds_per_q']}s/q)",
-        f"- **LLM:** `{summary['pipeline']['llm_base']}`"
+        f"- **LLM:** `{summary['pipeline']['llm_base'] or 'none (retrieval-only)'}`"
         + (f" + QLoRA adapter `{summary['pipeline']['qlora_adapter']}`" if summary['pipeline']['qlora_adapter'] else ""),
         f"- **Reranker:** {summary['pipeline']['reranker'] or 'none'}",
     ]
@@ -374,10 +468,13 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
         for k, v in data.items():
             lines.append(f"| {k} | {v:.4f} |" if isinstance(v, (int, float)) else f"| {k} | {v} |")
 
-    _emit_section("Generation", summary.get("generation"))
-    ci = summary.get("token_f1_95ci") or {}
-    if ci:
-        lines.append(f"| token_f1 (bootstrap 95% CI) | {ci['point']:.4f} [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
+    if summary.get("generation_skipped"):
+        lines.extend(["", "## Generation", "", "_SKIPPED — `--no-llm` retrieval-only run._"])
+    else:
+        _emit_section("Generation", summary.get("generation"))
+        ci = summary.get("token_f1_95ci") or {}
+        if ci:
+            lines.append(f"| token_f1 (bootstrap 95% CI) | {ci['point']:.4f} [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
 
     bs = summary.get("bertscore")
     if bs:
@@ -390,7 +487,8 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
         if bsci:
             lines.append(f"| f1 (bootstrap 95% CI) | {bsci['point']:.4f} [{bsci['ci_low']:.4f}, {bsci['ci_high']:.4f}] |")
 
-    _emit_section("Retrieval", summary.get("retrieval"))
+    gran = summary.get("retrieval_granularity")
+    _emit_section(f"Retrieval ({gran})" if gran else "Retrieval", summary.get("retrieval"))
     _emit_section("Faithfulness", summary.get("faithfulness"))
     _emit_section("Citation", summary.get("citation"))
 
