@@ -10,22 +10,32 @@ The system is designed to be runnable end-to-end on any Turkish legal corpus and
 # 1. Install
 pip install -r requirements.txt
 
-# 2. Index your corpus (any of: directory of PDFs/.txt/.md, JSONL, JSON array, Parquet)
-python -m hukuk_rag ingest \
-  --docs ./your_corpus_directory/ \
-  --out ./indexes/your_run/
+# 2. Index your corpus (any of: directory of PDFs/.txt/.md, JSONL, JSON array, Parquet).
+#    BASE RAG uses the stock encoder; FINE-TUNED RAG uses the fine-tuned E5 checkpoint.
+python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/base/
+python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/ft/ \
+  --embedding-model <path-to-fine-tuned-e5>   # FT-E5 checkpoint (on Google Drive — see Setup)
 
-# 3. Score a Q&A file against the indexes
-python -m hukuk_rag benchmark \
-  --questions ./your_questions.jsonl \
-  --indexes ./indexes/your_run/ \
-  --variant base \
-  --report ./reports/your_run/
+# 3. BASE RAG vs FINE-TUNED RAG on the SAME benchmark and SAME LLM (the graded comparison)
+python -m hukuk_rag benchmark --questions ./your_questions.jsonl \
+  --indexes ./indexes/base/ --variant base --report ./reports/base/
+python -m hukuk_rag benchmark --questions ./your_questions.jsonl \
+  --indexes ./indexes/ft/   --variant prod --report ./reports/ft/
 
-# 4. Ad-hoc query
+# 4. Ad-hoc query (Fine-tuned RAG)
 python -m hukuk_rag query "Kasten adam öldürmenin cezası nedir?" \
-  --indexes ./indexes/your_run/ --show-passages
+  --indexes ./indexes/ft/ --show-passages
 ```
+
+**Base RAG vs Fine-tuned RAG.** `--variant base` = stock encoder, no reranker, no
+snap. `--variant prod` = **Fine-tuned RAG** (fine-tuned E5 index + off-the-shelf
+Turkish reranker + source-filtered snap, `repetition_penalty=1.0`, **no QLoRA**) —
+this is the recommended, T4/L4-reproducible system that wins our comparison
+(+69.1% Token-F1, same 7B LLM). `--variant ft` is the **QLoRA generator**, a
+*documented regression* kept only for the ablation — do **not** use it for the
+Base-vs-Fine-tuned comparison. Both runs use the same `--llm-base` (default
+`Qwen/Qwen2.5-7B-Instruct`; pass `Qwen/Qwen2.5-14B-Instruct` on a ≥40 GB GPU for
+the +87.7% scaling result). Add `--no-llm` for GPU-free retrieval-only scoring.
 
 ### Accepted input shapes
 
