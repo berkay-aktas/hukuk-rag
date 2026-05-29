@@ -43,10 +43,11 @@ at your own data and get scored results back.
 pip install -r requirements.txt
 
 # 2. Index your corpus (directory of PDF/.txt/.md, JSONL, JSON array, or Parquet).
-#    Base RAG uses the stock encoder; Fine-tuned RAG uses a fine-tuned E5 checkpoint.
+#    Base RAG runs out-of-the-box with the stock encoder:
 python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/base/
+#    Fine-tuned RAG needs the fine-tuned E5 encoder (see "Fine-tuned checkpoint" below):
 python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/ft/ \
-  --embedding-model <path-or-hf-id-of-fine-tuned-e5>
+  --embedding-model <hf-id-or-local-path-of-fine-tuned-e5>
 
 # 3. Base RAG vs. Fine-tuned RAG on the SAME benchmark and SAME LLM
 python -m hukuk_rag benchmark --questions ./your_questions.jsonl \
@@ -64,6 +65,11 @@ python -m hukuk_rag query "Kasten adam öldürmenin cezası nedir?" \
 snap, `repetition_penalty=1.0`) — the recommended, T4/L4-reproducible system. Both runs share
 the same `--llm-base` (default `Qwen/Qwen2.5-7B-Instruct`; pass `Qwen/Qwen2.5-14B-Instruct` on
 a ≥ 40 GB GPU for the scaling result). Add `--no-llm` for GPU-free, retrieval-only scoring.
+
+> **Fine-tuned checkpoint.** `--variant base` reproduces out-of-the-box — the reranker and
+> generator download automatically. `--variant prod` (the recommended Fine-tuned RAG)
+> additionally requires the **fine-tuned E5 encoder**, which is distributed separately from
+> this repository; obtain it and pass its Hugging Face id or local path to `--embedding-model`.
 
 ### Accepted inputs
 
@@ -137,6 +143,8 @@ generation metrics are reported.
 | [turkish-law-chatbot](https://huggingface.co/datasets/Renicames/turkish-law-chatbot) | LLM supervised fine-tuning |
 | [turkishlaw-dataset (Kaggle)](https://www.kaggle.com/datasets/batuhankalem/turkishlaw-dataset-for-llm-finetuning) | LLM supervised fine-tuning |
 | `mevzuat.gov.tr` statute codes | Gold-set verification + statute corpus |
+
+*The SFT datasets fed the QLoRA generator experiment, reported as a documented negative result (see paper §VII).*
 
 ## Project structure
 
