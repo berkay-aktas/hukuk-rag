@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software or its findings, please cite it as below."
+title: "Improving Turkish Legal Question Answering with a Triage-Driven Retrieval-Augmented Generation Pipeline"
+type: software
+authors:
+  - given-names: Berkay
+    family-names: Aktaş
+  - given-names: Arzu Tuğçe
+    family-names: Koca
+  - given-names: Şahin
+    family-names: Erşan
+date-released: 2026-05-30
+year: 2026
+url: "https://github.com/berkay-aktas/hukuk-rag"
+repository-code: "https://github.com/berkay-aktas/hukuk-rag"
+license: MIT
+keywords:
+  - retrieval-augmented-generation
+  - turkish-nlp
+  - legal-nlp
+  - information-retrieval
+  - large-language-models
