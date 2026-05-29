@@ -62,6 +62,9 @@ professor_audio_transcription.txt
 *.log
 .cache/
 
+# Exploratory scratchpad notebooks (not for the public repo)
+notebooks/scratchpads/
+
 # Local handoff notes (not for git)
 reports/HANDOFF.md
 reports/EXPERIMENTS.md
