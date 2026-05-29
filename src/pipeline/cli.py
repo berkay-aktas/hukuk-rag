@@ -5,19 +5,20 @@ and 4 (custom corpus + custom benchmark):
 
 ::
 
-    # 1. Build indexes from any corpus format
-    python -m hukuk_rag ingest --docs ./my_corpus_dir/ --out ./indexes/
-    python -m hukuk_rag ingest --docs corpus.jsonl --out ./indexes/
+    # 1. Build indexes. For BASE RAG use the stock encoder (default);
+    #    for FINE-TUNED RAG point --embedding-model at the fine-tuned E5 checkpoint.
+    python -m hukuk_rag ingest --docs ./my_corpus_dir/ --out ./indexes/base/
+    python -m hukuk_rag ingest --docs ./my_corpus_dir/ --out ./indexes/ft/ \\
+        --embedding-model ./models/ft-e5/
 
-    # 2. Score a custom Q&A file against those indexes
-    python -m hukuk_rag benchmark \\
-        --questions ./my_questions.jsonl \\
-        --indexes ./indexes/ \\
-        --variant ft \\
-        --report ./report/
+    # 2. Score a custom Q&A file: BASE RAG vs FINE-TUNED RAG, same LLM.
+    python -m hukuk_rag benchmark --questions ./my_questions.jsonl \\
+        --indexes ./indexes/base/ --variant base --report ./report/base/
+    python -m hukuk_rag benchmark --questions ./my_questions.jsonl \\
+        --indexes ./indexes/ft/   --variant prod --report ./report/ft/
 
     # 3. Ad-hoc query
-    python -m hukuk_rag query "Kasten öldürmenin cezası nedir?" --indexes ./indexes/
+    python -m hukuk_rag query "Kasten öldürmenin cezası nedir?" --indexes ./indexes/ft/
 """
 
 from __future__ import annotations
@@ -54,7 +55,10 @@ def main(argv: list[str] | None = None) -> int:
                           help="Path to corpus (jsonl/json/parquet/directory). Can be repeated.")
     p_ingest.add_argument("--out", required=True, help="Output directory for the index bundle.")
     p_ingest.add_argument("--embedding-model", default="intfloat/multilingual-e5-large",
-                          help="HF model id or local path. Default: multilingual-e5-large.")
+                          help="HF model id or local path. Default: BASE multilingual-e5-large "
+                               "(use this index with --variant base for Base RAG). For Fine-tuned "
+                               "RAG, pass the fine-tuned E5 checkpoint path — the embedding "
+                               "adaptation is the one fine-tuning win (see README).")
     p_ingest.add_argument("--no-faiss", action="store_true", help="Skip FAISS build.")
     p_ingest.add_argument("--no-bm25", action="store_true", help="Skip BM25 build.")
     p_ingest.add_argument("--chunk-max-tokens", type=int, default=480)
@@ -65,10 +69,13 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--questions", required=True, help="Path to benchmark file (json/jsonl).")
     p_bench.add_argument("--indexes", required=True, help="Path to index bundle directory.")
     p_bench.add_argument("--report", required=True, help="Output report directory.")
-    p_bench.add_argument("--variant", choices=["base", "ft", "ft+rerank", "prod"], default="ft",
-                         help="Model variant. base=vanilla Qwen; ft=QLoRA; ft+rerank=QLoRA+reranker; "
-                              "prod=production headline (off-shelf reranker + snap + rep_penalty 1.0, NO QLoRA). "
-                              "Choose the LLM with --llm-base (e.g. Qwen/Qwen2.5-14B-Instruct).")
+    p_bench.add_argument("--variant", choices=["base", "ft", "ft+rerank", "prod"], default="prod",
+                         help="Model variant. base=BASE RAG (vanilla Qwen, no reranker/snap); "
+                              "prod=FINE-TUNED RAG / RECOMMENDED (off-shelf reranker + source-filtered "
+                              "snap + rep_penalty 1.0, NO QLoRA); ft=QLoRA generator (a DOCUMENTED "
+                              "REGRESSION, requires --qlora-adapter); ft+rerank=QLoRA+reranker. "
+                              "For the Base-vs-Fine-tuned comparison run 'base' vs 'prod' on matching "
+                              "(base-E5 vs FT-E5) indexes. Choose the LLM with --llm-base.")
     p_bench.add_argument("--qlora-adapter", help="Path to QLoRA adapter dir (required for ft/ft+rerank).")
     p_bench.add_argument("--llm-base", default="Qwen/Qwen2.5-7B-Instruct")
     p_bench.add_argument("--reranker", help="Reranker model id or path (default: off-shelf bge-reranker-turkish).")
