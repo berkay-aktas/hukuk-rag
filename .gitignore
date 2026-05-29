@@ -51,8 +51,9 @@ sample_data/
 *.mp3
 *.wav
 
-# Assignment PDF
+# PDFs (assignment specs / build artifacts) — ignore all except the final report
 *.pdf
+!reports/final_report.pdf
 
 # Transcriptions
 professor_audio_transcription.txt
