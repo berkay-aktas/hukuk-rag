@@ -23,8 +23,8 @@
 % Compact table font
 \newcommand{\tnote}[1]{{\footnotesize #1}}
 \newcommand{\best}[1]{\textbf{#1}}
-\newcommand{\good}{\textcolor{green!55!black}{$\uparrow$}}
-\newcommand{\bad}{\textcolor{red!70!black}{$\downarrow$}}
+\newcommand{\good}{\textcolor{green!55!black}{\ensuremath{\uparrow}}}
+\newcommand{\bad}{\textcolor{red!70!black}{\ensuremath{\downarrow}}}
 
 \begin{document}
 
@@ -33,36 +33,34 @@ Triage-Driven Retrieval-Augmented Generation Pipeline}
 
 \author{
 \IEEEauthorblockN{Berkay Akta\c{s} \quad Arzu Tu\u{g}\c{c}e Koca \quad \c{S}ahin Er\c{s}an}
-\IEEEauthorblockA{CENG493 --- Department of Computer Engineering\\
-\texttt{github.com/berkay-aktas/hukuk-rag}}
+\IEEEauthorblockA{Department of Software Engineering, \c{C}ankaya University\\
+CENG493 Term Project \quad \texttt{github.com/berkay-aktas/hukuk-rag}}
 }
 
 \maketitle
 
 \begin{abstract}
 We present a domain-adapted retrieval-augmented generation (RAG) system for
-Turkish legal question answering, and a controlled ablation that inverts a
-common assumption about where adaptation pays off. Starting from a naive hybrid
-baseline (Token~F1 $0.1411$), we evaluate three independent fine-tuning
-interventions---a contrastively adapted dense encoder, a domain-tuned
-cross-encoder reranker, and a QLoRA-tuned generator---against a $225$-question
-gold set verified against official statute text. A failure-mode triage
-performed \emph{before} spending compute reveals that generation, not
-retrieval, is the dominant bottleneck; and the ablation shows that
-\emph{only} embedding fine-tuning helps, while our fine-tuned reranker and
-single-passage QLoRA both \emph{degrade} end-to-end accuracy. The decisive
-gains instead come from (i)~an off-the-shelf Turkish reranker, (ii)~a
-source-filtered verbatim-snap post-processor, and (iii)~scaling the generator
-from 7B to 14B parameters---together lifting Token~F1 to \best{$0.2648$}
-($+87.7\%$ over baseline), BERTScore~F1 to $0.716$, and an LLM-judged
-correctness of $0.75$ (validated against an independent Claude judge,
-Spearman~$\rho{=}0.72$, $p{<}0.001$), while roughly halving the hallucination
-rate ($17.0\%\rightarrow 8.95\%$). Production retrieval attains Recall@10
-$0.875$ on a chunk-labeled benchmark. We characterize each failed intervention
-as a transferable negative result---silver-label noise, a single-passage /
-multi-passage format mismatch that paradoxically lifts faithfulness $+24$pp
-while lowering Token~F1, and a generator domain-knowledge gap that breaks
-HyDE---and ship an evaluator-agnostic pipeline that runs the full
+Turkish legal question answering and a controlled ablation that inverts a common
+assumption about where adaptation pays off. From a naive hybrid baseline
+(Token~F1 $0.1411$), we evaluate three fine-tuning interventions---a dense
+encoder, a cross-encoder reranker, and a QLoRA generator---on a $225$-question
+gold set verified against official statute text. A failure-mode triage run
+\emph{before} spending compute shows generation, not retrieval, is the dominant
+bottleneck, and the ablation shows \emph{only} embedding fine-tuning helps: the
+fine-tuned reranker and single-passage QLoRA both \emph{degrade} end-to-end
+accuracy. The decisive gains come instead from an off-the-shelf Turkish reranker
+and a source-filtered verbatim-snap post-processor---holding the generator fixed
+at Qwen-7B, this fine-tuned pipeline lifts Token~F1 $+69.1\%$
+($0.1411\rightarrow 0.2386$; Wilcoxon $p{<}0.001$, disjoint CIs) and LLM-judged
+correctness $0.444\rightarrow 0.736$ (validated against an independent Claude
+judge, $\rho{=}0.72$). An optional 14B generator adds $+11\%$ (to
+\best{$0.2648$}, $+87.7\%$ cumulative; BERTScore $0.716$) and halves
+hallucination ($17.0\%\rightarrow 8.95\%$); production retrieval attains
+Recall@10 $0.875$. We distil each failure into a transferable negative
+result---silver-label noise, a single-/multi-passage format mismatch that lifts
+faithfulness $+24$pp yet lowers Token~F1, and a domain-knowledge gap that breaks
+HyDE---and ship an evaluator-agnostic pipeline scoring the full
 Recall\,+\,F1\,+\,Faithfulness suite on arbitrary user-supplied documents.
 \end{abstract}
 
@@ -82,7 +80,11 @@ lemma---and with locale-specific casing (the capital ``I'' maps to dotless
 Generation must produce \emph{grounded} answers that cite specific provisions
 (e.g., ``\emph{5237 say\i l\i\ TCK Madde~81}'') while minimizing
 hallucination---a consequential failure mode in a legal setting, where a
-confidently wrong citation is worse than an abstention.
+confidently wrong citation is worse than an abstention. These difficulties are
+not incidental: recent work on Turkish RAG frames them as a \emph{language
+gap}---pipelines assembled from English-centric components underperform on
+Turkish---and finds that adapting the \emph{retrieval} components to Turkish is
+the primary lever for recovery~\cite{bikmaz2025bridging}.
 
 We build a modular pipeline with three independently fine-tunable stages---a
 multilingual dense encoder, a cross-encoder reranker, and a quantized
@@ -99,7 +101,8 @@ off-the-shelf components, a lightweight post-processor, and model scale.
 \begin{enumerate}
 \item A complete, reproducible Turkish-legal RAG pipeline (hybrid
 retrieval, cross-encoder reranking, verbatim-snap post-processing, quantized
-generation) that lifts a naive baseline by \best{$+87.7\%$} Token~F1, with
+generation) that, \emph{holding the generator fixed}, lifts a naive baseline by
+\best{$+69.1\%$} Token~F1 ($+87.7\%$ with an optional 14B generator), with
 hallucination roughly halved.
 \item A \emph{triage-before-tuning} methodology that attributes the error
 budget to retrieval / reranking / generation \emph{before} committing GPU
@@ -141,6 +144,21 @@ a semantic complement to lexical overlap, and LLM-as-judge
 protocols~\cite{zheng2023judge} approximate human preference at scale, albeit
 with documented self-preference bias.
 
+A small but growing body of work studies RAG \emph{for Turkish} directly.
+B\i kmaz et al.~\cite{bikmaz2025bridging} frame the core problem as a language
+gap and show, on Turkish Wikipedia QA, that fine-tuning the retrieval stack (a
+Turkish-adapted multilingual-e5 encoder and a fine-tuned cross-encoder reranker,
+fused with BM25) is the dominant lever for answer quality, while LLM-based
+sentence-rewriting (``prepositional'') chunking \emph{degraded} retrieval by
+stripping contextual richness. Atag\"un et al.~\cite{atagun2025rag} compare
+several generators (LLaMA-3.1-8B, Gemma-3-12B, Qwen-14B, DeepSeek-R1-14B) in a
+Turkish-QA RAG framework and find a well-retrieved smaller model competitive
+with larger ones. Both are \emph{general-domain} (Turkish Wikipedia and
+open-domain QA); we extend Turkish RAG to the \emph{legal} domain, where
+structure-preserving chunking, statute-grounded citation, and hallucination
+control are first-order, and the multilingual, multi-domain retrieval B\i kmaz
+et al.\ flag as open is acute.
+
 Turkish legal NLP remains under-resourced: prior work emphasizes named-entity
 recognition and document classification, and the closest QA-adjacent resource
 targets sentence-level entailment rather than generative, citation-grounded
@@ -154,12 +172,13 @@ pipeline with a component-isolating ablation and a deliberate emphasis on
 Figure~\ref{fig:arch} shows the pipeline. A normalized query is embedded by a
 fine-tuned E5 encoder for dense search and tokenized (Turkish-aware) for BM25;
 per-source rankings are RRF-fused. An off-the-shelf Turkish cross-encoder
-reranks the fused top-$k$. The top passages condition a quantized Qwen-2.5
-generator, and a verbatim-snap post-processor optionally replaces a paraphrased
+reranks the fused top-$k$. The top passages condition a quantized
+Qwen-2.5~\cite{qwen2024} generator, and a verbatim-snap post-processor
+optionally replaces a paraphrased
 answer with the source sentence it most overlaps---\emph{after} filtering
 case-law passages whose style mismatches the statute-formulated gold.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
 \begin{tikzpicture}[
   font=\scriptsize,
@@ -184,7 +203,7 @@ case-law passages whose style mismatches the statute-formulated gold.
 adaptation; only the dense encoder's fine-tuning survived ablation (the
 reranker is used off-the-shelf; the snap stage is rule-based).}
 \label{fig:arch}
-\end{figure}
+\end{figure*}
 
 \textbf{Models.} Table~\ref{tab:models} lists the component inventory. A strict
 VRAM discipline (one large model resident at a time; explicit cache eviction
@@ -195,6 +214,7 @@ between stages) keeps the system within a 16--24\,GB budget; all fine-tuning is
 \caption{Model inventory.}
 \label{tab:models}
 \centering\footnotesize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{@{}llll@{}}
 \toprule
 Model & Params & Role & Adapted \\
@@ -203,9 +223,9 @@ Model & Params & Role & Adapted \\
 \texttt{bge-reranker-v2-m3-tr} & 560M & Cross-encoder & Off-shelf \\
 \texttt{Qwen2.5-7B-Instruct}   & 7B   & Generator     & QLoRA (neg.) \\
 \texttt{Qwen2.5-14B-Instruct}  & 14B  & Generator (prod.) & No (4-bit) \\
-\texttt{bert-...-turkish-nli}  & 110M & Faithfulness  & No \\
+\texttt{bert-base-turkish-nli}  & 110M & Faithfulness  & No \\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{table}
 
 %==============================================================================
@@ -215,7 +235,10 @@ Model & Params & Role & Adapted \\
 Documents are deduplicated and chunked with a legal-aware hierarchical splitter:
 first on article boundaries (\texttt{Madde~\textbackslash d+}), then on section
 headers (\textsc{B\"{o}l\"{u}m}, \textsc{K\i s\i m}, \textsc{Fas\i l}), then on
-paragraph breaks, with recursive character splitting as a fallback. Chunks are
+paragraph breaks, with recursive character splitting as a fallback. We
+deliberately \emph{preserve} document structure rather than rewriting chunks
+into standalone sentences; the latter has been shown to degrade Turkish
+retrieval by stripping contextual richness~\cite{bikmaz2025bridging}. Chunks are
 capped at $480$ tokens with $64$-token overlap to respect E5's $512$-token limit
 after the \texttt{passage:} prefix. Retrieval spans three sub-corpora: Turkish
 Supreme Court (Yarg\i tay) decisions covered lexically by BM25, $45$ statute
@@ -269,10 +292,15 @@ examples with a strict source-grounding system prompt.
 We constructed a $225$-question evaluation set, each entry verified against
 official statute text (article number, source code, expected text, provenance),
 balanced across five legal domains and three difficulty tiers
-(Table~\ref{tab:gold}), and including intentionally unanswerable questions to
-test refusal. A cross-LLM audit (five independent verifiers against canonical
-\texttt{mevzuat.gov.tr} text) raised verbatim correctness from $91.1\%$ to
-$100\%$. The set is evaluation-only; no component is trained on it.
+(Table~\ref{tab:gold}), and including $48$ intentionally unanswerable questions
+($21\%$) to test refusal. A cross-LLM audit (five independent verifiers against
+canonical \texttt{mevzuat.gov.tr} text) raised verbatim correctness from
+$91.1\%$ to $100\%$. The set is evaluation-only; no component is trained on it.
+A leakage audit confirms this is clean rather than asserted: $0$ exact and $0$
+near-duplicate matches (max Jaccard $0.33$) of the $225$ gold questions against
+$31{,}380$ shared-bundle training texts---versus $35\%$ near-duplicate
+($\geq 0.8$) for the course-provided shared benchmark we use only for
+cross-validation (Section~\ref{sec:recall}).
 
 \begin{table}[t]
 \caption{Gold set distribution ($225$ questions).}
@@ -282,10 +310,13 @@ $100\%$. The set is evaluation-only; no component is trained on it.
 \toprule
 Domain & Easy & Medium & Hard & Total \\
 \midrule
-Criminal / Civil / Commercial & 12 & 18 & 15 & 45 each \\
-Administrative / Constitutional & 12 & 18 & 15 & 45 each \\
+Criminal        & 16 & 14 & 17 & 47 \\
+Civil           & 15 & 16 & 15 & 46 \\
+Commercial      & 14 & 15 & 15 & 44 \\
+Administrative  & 15 & 14 & 15 & 44 \\
+Constitutional  & 14 & 16 & 14 & 44 \\
 \midrule
-\textbf{Total} & 60 & 90 & 75 & \textbf{225}\\
+\textbf{Total}  & \textbf{74} & \textbf{75} & \textbf{76} & \textbf{225}\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -293,8 +324,17 @@ Administrative / Constitutional & 12 & 18 & 15 & 45 each \\
 \subsection{Metrics}
 We report \emph{lexical} (Token~F1, ROUGE-L, BLEU), \emph{semantic} (BERTScore-F1
 with multilingual BERT), and \emph{retrieval} (Recall@$k$, MRR, nDCG@10) metrics,
-all under Turkish-aware normalization. Token~F1 carries bootstrap $95\%$ CIs
-($1000$ resamples) and Wilcoxon signed-rank paired tests between configurations.
+all under Turkish-aware normalization. Each axis is chosen for a reason specific
+to legal QA: Token~F1 rewards verbatim reuse of statute wording; BERTScore credits
+semantically correct answers that Turkish agglutinative morphology renders
+lexically divergent (whitespace overlap systematically under-counts inflected
+forms); NLI faithfulness (Section~\ref{sec:faith}) targets the consequential legal
+failure mode---confidently wrong grounding; and the retrieval triplet separates coverage
+(Recall@$k$) from ranked relevance (MRR, nDCG@10). Following the rubric's
+metric-availability branch, we report retrieval metrics when relevant-document
+labels exist and generation metrics otherwise; both are available on our gold
+set. Token~F1 carries bootstrap $95\%$ CIs ($1000$ resamples, fixed seed) and
+Wilcoxon signed-rank paired tests between configurations.
 
 \textbf{LLM-as-judge.} A judge scores \texttt{(question, gold, prediction,
 context)} on correctness, faithfulness, coherence, and relevancy. We hold the
@@ -303,13 +343,31 @@ apples-to-apples, and we explicitly \emph{validate} it: on a stratified
 $30$-question subset, an independent Claude Opus judge agrees on the load-bearing
 axes (Spearman $\rho{=}0.72$ correctness, $0.64$ relevancy; both $p{<}0.001$),
 preserving the configuration ranking, while revealing that the same-model judge
-over-credits correctness by $\approx 0.28$ absolute. We therefore treat absolute
-judge scores as upper bounds and rely on the \emph{ranking}.
+over-credits correctness by $\approx 0.28$ absolute. Agreement is weaker on
+faithfulness ($\rho{=}0.28$, $p{=}0.13$) and near-zero on coherence
+($\rho{=}0.06$, $p{=}0.77$)---the latter because both judges rate coherence near
+ceiling, leaving no variance to correlate. This validation used the 7B (C3)
+predictions; for the 14B rows we lean on judge-independent Token~F1 and
+BERTScore. We therefore treat absolute judge scores as upper bounds and rely on
+the \emph{ranking}.
 
-\textbf{Evaluation scenarios.} Following the course rubric, we compose two
-multi-axis scenarios from these metrics: Scenario~2 weights F1\,+\,faithfulness,
-Scenario~3 weights correctness\,+\,relevancy\,+\,coherence; Scenario~1 (recall-
-weighted) is reported separately in Section~\ref{sec:recall}.
+\textbf{Evaluation scenarios.} Following the course rubric, we operationalize
+three composite scenarios from the per-axis scores, with the weights used to
+produce every composite below: Scenario~1 $=0.35\,$Recall@$k$ $+\,0.40\,$Correctness
+$+\,0.25\,$Faithfulness; Scenario~2 $=0.70\,$Correctness $+\,0.30\,$BERTScore;
+Scenario~3 $=\mathrm{mean}$(Faithfulness, Relevancy, Coherence). The recall-bearing
+Scenario~1 is reported in Section~\ref{sec:recall}; the Fine-tuned-RAG (7B)
+composites are Scenario~2 $=0.726$ and Scenario~3 $=0.805$, rising to $0.740$ and
+$0.811$ with the optional 14B generator.
+
+\textbf{Reproducibility.} All runs fix
+\texttt{torch}/\texttt{numpy}/\texttt{random} seeds; bootstrap CIs use $1000$
+resamples; the LLM-judge is a fixed Qwen-7B scored on $[0,1]$ per axis, with the
+stratified validation subset drawn at seed $42$. Library versions are pinned in
+\texttt{requirements.txt} (the 14B load behavior is version-sensitive). Code,
+configs, and the gold set are in the repository; fine-tuned checkpoints and
+prebuilt indexes are hosted separately (Google Drive), and the \texttt{ingest}
+CLI rebuilds indexes from any corpus.
 
 %==============================================================================
 \section{Results}
@@ -322,7 +380,10 @@ the single effect of model scale.
 \caption{Master ablation on the $225$-question gold set. The generator's
 LLM-judge is held fixed (Qwen-7B) across all rows so scoring is comparable;
 Phase~6 changes only the generator (7B$\rightarrow$14B). Best per column in
-\textbf{bold}.}
+\textbf{bold}. C1/C2 judge-faithfulness is omitted (---): their legacy
+predictions did not store retrieved context, so the grounding judge had nothing
+to score; the Base-vs-production faithfulness contrast is instead via NLI
+(Section~\ref{sec:faith}; $17.0\%\rightarrow 8.95\%$ hallucination).}
 \label{tab:ablation}
 \centering\footnotesize
 \begin{tabular}{@{}llccc c ccc@{}}
@@ -339,26 +400,78 @@ C3 (+reranker+snap) & FT E5 & off-shelf & Yes & 7B & $0.2386$ & $0.7026$ & $0.73
 \end{tabular}
 \end{table*}
 
-\textbf{The headline arc.} From the naive baseline to the production system,
-Token~F1 rises $0.1411\rightarrow 0.2648$ (\best{$+87.7\%$}); BERTScore
-$0.650\rightarrow 0.716$; LLM-judged correctness $0.444\rightarrow 0.750$
-($+68.8\%$) and relevancy $0.581\rightarrow 0.849$ ($+46.0\%$). The
-single-intervention effect of model scale (C3$\rightarrow$Phase~6) is
-$+0.0262$ F1 ($+11.0\%$) with non-overlapping CIs (Phase~6's lower bound
-$0.243$ exceeds C3's point estimate $0.239$).
+\begin{table}[t]
+\caption{Component decomposition of the master ablation on the own $225$-q gold
+(Token~F1). Rows are \emph{cumulative}---each adds one component to the row
+above, building C1$\to$C3; the generator is then changed two ways \emph{from}
+C3. The running F1 reconciles with Table~\ref{tab:ablation}; $\Delta$ are
+sequential (order-dependent) marginals, not independent leave-one-out effects.}
+\label{tab:components}
+\centering\footnotesize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Step (cumulative) & Token~F1 & $\Delta$ \\
+\midrule
+base E5 $+$ BM25 \;(C1)               & $0.1411$ & --- \\
+\quad $+$ FT embedding \;(C2)         & $0.1678$ & $+0.0267$ \\
+\quad $+$ 3-corpus expansion          & $0.1948$ & $+0.0270$ \\
+\quad $+$ off-shelf reranker          & $0.2235$ & $+0.0287$ \\
+\quad $+$ source-filtered snap \;(C3) & $0.2386$ & $+0.0151$ \\
+\midrule
+from C3: $+$ QLoRA generator          & $0.1741$ & $\bad\,-0.0645$ \\
+from C3: 7B$\to$14B \;(Phase~6)       & $0.2648$ & $\good\,+0.0262$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
 
-\textbf{Base vs.\ Fine-tuned, same generator.} The rubric asks for a
-Base-vs-Fine-tuned comparison holding the LLM constant. Our clean such
-comparison is C1 vs.\ C3 (both Qwen-7B): $0.1411\rightarrow 0.2386$, a
-$+69.1\%$ relative improvement attributable to retrieval/reranking/post-
-processing rather than generator scale. We report the 14B result as a separate
-\emph{scaling} axis, not as the fine-tuning contribution, to avoid conflating
-the two.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_headline}
+\caption{Headline metric progression across the ablation (own $225$-q gold):
+Base RAG (C1)~$\to$~Fine-tuned RAG (C3, same Qwen-7B)~$\to$~optional 14B (Phase~6).
+Token~F1, BERTScore, and LLM-judged correctness rise monotonically.}
+\label{fig:headline}
+\end{figure}
 
-\textbf{Significance and cost.} Wilcoxon paired tests confirm
-C1$\rightarrow$C2 ($p{=}0.003$) and C2$\rightarrow$C3 ($p{<}0.001$) on Token~F1;
-the C3$\rightarrow$Phase~6 BERTScore CIs are non-overlapping. Inference cost is
-$14$\,s/query (7B) to $26$\,s/query (14B) on an L4---well within budget.
+\textbf{Base RAG vs.\ Fine-tuned RAG (the rubric comparison).} Holding the
+generator fixed at Qwen-7B, our \emph{Fine-tuned RAG} (FT-E5 dense encoder $+$
+off-the-shelf reranker $+$ source-filtered snap; C3) beats \emph{Base RAG}
+(base E5, no reranker, no snap; C1) on Token~F1 ($0.1411\rightarrow 0.2386$,
+$+69.1\%$; Wilcoxon $p{<}0.001$; non-overlapping $95\%$ CIs) and on LLM-judged
+correctness ($0.444\rightarrow 0.736$; Figure~\ref{fig:headline}). This is the
+apples-to-apples, same-LLM
+comparison the rubric requires; \emph{we recommend Fine-tuned RAG as the deployed
+system}, and the evaluator's own benchmark is scored through both configurations
+identically (Section~\ref{sec:deploy}).
+
+\textbf{Optional generator scaling.} Swapping \emph{only} the generator to 14B
+(C3$\rightarrow$Phase~6) adds a further $+0.0262$ Token~F1 ($+11.0\%$; Phase~6's
+lower CI bound $0.243$ exceeds C3's point estimate $0.239$), lifting the
+cumulative baseline-to-production gain to \best{$+87.7\%$} Token~F1, BERTScore
+$0.650\rightarrow 0.716$, correctness $0.444\rightarrow 0.750$ ($+68.8\%$), and
+relevancy $0.581\rightarrow 0.849$ ($+46.0\%$). Because the 14B weights exceed
+some Colab GPU budgets \emph{at load} (Section~\ref{sec:disc}), the 7B Fine-tuned
+RAG above is the recommended, fully-reproducible default; 14B is an optional
+drop-in.
+
+\textbf{Component decomposition.} Table~\ref{tab:components} breaks the master
+ablation into single-component steps. Embedding fine-tuning adds $+0.0267$
+Token~F1 (C1$\to$C2, Wilcoxon $p{=}0.003$); within the $+0.0708$ C2$\to$C3 jump
+($p{<}0.001$), corpus expansion contributes $+0.0270$, the off-the-shelf
+reranker $+0.0287$, and the rule-based snap $+0.0151$. For the generator---the
+LLM-fine-tuning arm---QLoRA significantly \emph{regresses} ($-0.0645$;
+Section~\ref{sec:neg}), whereas scaling to 14B \emph{helps} ($+0.0262$, paired
+$p{=}0.0018$). These are sequential (order-dependent) marginals that
+\emph{decompose}, rather than independently sum to, the end-to-end gain; the
+fine-tuned reranker is a separate documented regression (Section~\ref{sec:neg}).
+
+\textbf{Significance and cost.} Wilcoxon paired tests confirm every step on
+Token~F1: C1$\rightarrow$C2 ($p{=}0.003$), C2$\rightarrow$C3 ($p{<}0.001$), and
+the model-scale step C3$\rightarrow$Phase~6 ($W{=}7170$, $p{=}0.0018$, $n{=}225$;
+$111$ wins / $85$ losses / $29$ ties), which also has non-overlapping bootstrap
+CIs. Inference cost is $14$\,s/query (7B) to $26$\,s/query (14B) on an L4---well
+within budget.
 
 %==============================================================================
 \section{Component Analysis and Negative Results}
@@ -378,11 +491,15 @@ priority and motivates the snap post-processor and generator scaling.
 
 \subsection{Five Negative Results}
 Table~\ref{tab:neg} collects the interventions that \emph{failed}, each with a
-transferable cause. We argue these are as informative as the positive results.
+transferable cause. We argue these are as informative as the positive
+results---and they are the evidence \emph{behind} our production choices (an
+off-the-shelf reranker, no QLoRA), not a retreat from fine-tuning, whose
+embedding-level win remains decisive (Table~\ref{tab:components}).
 
 \begin{table}[t]
-\caption{Negative results. $\Delta$ is Token~F1 vs.\ the relevant comparison
-configuration.}
+\caption{Negative results. $\Delta$ is Token~F1 against each intervention's own
+pre-intervention configuration (fine-tuned reranker and QLoRA vs.\ C3;
+multi-query vs.\ the reranker stage; citation-snap vs.\ Phase~6).}
 \label{tab:neg}
 \centering\footnotesize
 \begin{tabular}{@{}lcp{3.2cm}@{}}
@@ -423,10 +540,16 @@ it is constrained at inference.
 
 %==============================================================================
 \section{Faithfulness and Hallucination}
+\label{sec:faith}
 %==============================================================================
 We measure faithfulness with a Turkish NLI sentence encoder: each answer
 sentence is scored by its maximum similarity to any retrieved-context sentence;
-sentences below $0.50$ are flagged as hallucinated. On the production
+sentences below $0.50$ are flagged as hallucinated. The $0.50$ cut is a fixed
+midpoint; a sensitivity sweep confirms the 7B$\rightarrow$14B reduction is
+not an artifact of it---14B hallucinates strictly less at every threshold
+$\tau\in\{0.4,0.5,0.6,0.7\}$ (relative reduction $1.3$--$2.8\times$; e.g.\
+$12.5\%\rightarrow 4.5\%$ at $\tau{=}0.4$ and $26.6\%\rightarrow 19.0\%$ at
+$\tau{=}0.6$). On the production
 (Phase~6) system, mean NLI faithfulness is $0.765$ and the hallucination rate
 is $\best{8.95\%}$---roughly half the $17.0\%$ of the 7B configuration. The
 difficulty gradient persists but flattens: hard questions hallucinate at
@@ -468,9 +591,11 @@ Recall@5 $0.854$, \best{Recall@10 $0.875$}, MRR $0.770$, nDCG@10 $0.796$---up
 from $0.79$ Recall@10 for the dense-only baseline.
 
 \noindent\emph{Honest caveat.} This benchmark is a course-provided set, not the
-held-out evaluation, and is plausibly in-distribution for our fine-tuned
-encoder; we therefore treat its recall as an \emph{upper bound}, not a
-prediction of held-out performance. The value of this number is as evidence
+held-out evaluation, and is \emph{measurably} in-distribution for our fine-tuned
+encoder: a leakage audit finds $84/240$ ($35\%$) of its questions near-duplicate
+($\geq 0.8$ Jaccard) to the shared training texts, versus $0/225$ for our own
+gold. We therefore treat its recall as an \emph{upper bound}, not a prediction
+of held-out performance. The value of this number is as evidence
 that the retrieval machinery and our metric pipeline are sound---and the
 deployed system computes the same metric on any evaluator-supplied benchmark
 (Section~\ref{sec:deploy}).
@@ -492,18 +617,51 @@ benchmark labels relevance by document rather than by our internal chunk IDs
 
 We validate this end to end: ingesting three previously unseen statute PDFs and
 running the production configuration on a hand-written Turkish benchmark yields
-document-level Recall@10 $=1.0$, zero language derailment, and coherent Turkish
-answers (one verbatim-snapping a statute article, one correctly abstaining).
-This confirms the pipeline satisfies the ``bring-your-own-data'' requirement
-with the full metric suite intact.
+document-level Recall@10 $=1.0$ (a $5$-question probe---small enough that the
+saturated recall is illustrative, not a performance claim), zero language
+derailment, and coherent Turkish answers (one verbatim-snapping a statute
+article, one correctly abstaining). The load-bearing result is not the number
+but that the \emph{entire} pipeline---ingest, index, retrieve, rerank, generate,
+score---runs unattended on documents and a benchmark it has never seen, through
+the same metric code path as the $225$-q evaluation, satisfying the
+``bring-your-own-data'' requirement.
+
+\textbf{Recommended configuration.} The default evaluator setup is the 7B
+Fine-tuned RAG (\texttt{-{}-variant prod}), which wins the Base-vs-Fine-tuned
+comparison ($+69.1\%$ Token~F1) and runs on any T4/L4; the Base-RAG baseline is a
+one-flag change (\texttt{-{}-variant base}), so the two systems are scored through
+an identical path. Because retrieval is hybrid (FT-E5 $+$ BM25 $+$ RRF), the
+training-free BM25 channel floors recall even when the dense encoder meets
+out-of-distribution statutes, bounding the risk that the fine-tuned encoder's
+advantage fails to transfer to the evaluator's documents.
 
 %==============================================================================
 \section{Discussion and Limitations}
+\label{sec:disc}
 %==============================================================================
-\textbf{Adaptation $\neq$ fine-tuning.} Our strongest single lever was model
-scale (7B$\rightarrow$14B), which is \emph{not} domain adaptation; among genuine
-fine-tuning interventions only the embedding encoder helped. We report these
-honestly rather than packaging scale as a fine-tuning win.
+\textbf{Adaptation $\neq$ fine-tuning.} Embedding fine-tuning delivered a
+genuine, statistically significant retrieval and end-to-end win, and it---plus
+the production pipeline---is what makes Fine-tuned RAG beat Base RAG. Beyond it,
+our strongest \emph{additional} lever was model scale (7B$\rightarrow$14B), which
+is \emph{not} domain adaptation; among the other fine-tuning interventions, the
+reranker and QLoRA regressed. We report this distinction honestly rather than
+packaging scale as a fine-tuning win. That retrieval and pipeline design, not
+generator size, dominate our gains echoes independent Turkish-RAG evidence that
+a well-retrieved smaller generator can rival larger ones~\cite{atagun2025rag},
+underwriting our 7B configuration as the recommended default with 14B an
+optional bonus.
+
+\textbf{Reranker adaptation is label-quality-dependent.}
+B\i kmaz et al.~\cite{bikmaz2025bridging} obtain their best Turkish-RAG
+configuration by fine-tuning the cross-encoder reranker with hard-negative
+mining on curated data. Our result refines rather than contradicts theirs:
+fine-tuning the reranker on \emph{noisy silver} labels (token-overlap
+pseudo-relevance, with $52\%$ of training queries having no true-positive
+passage) \emph{regressed} end-to-end F1 (Section~\ref{sec:neg}), so we reached
+Turkish-domain reranking by the more label-robust route of an off-the-shelf
+Turkish-adapted cross-encoder. Reranker fine-tuning thus helps when supervision
+is clean and hurts when it is not---an argument for curated hard negatives or,
+absent them, an off-the-shelf model.
 
 \textbf{Self-reported numbers are evidence, not predictions.} The gold and
 shared sets measure methodology and system quality; the graded evaluation is on
@@ -515,14 +673,17 @@ retrieval-failure source. (ii)~The QLoRA format mismatch is fixable by training
 on multi-passage data, which would likely convert the $+24$pp faithfulness gain
 into a Token~F1 gain. (iii)~On the most recent Colab image, the updated
 \texttt{transformers} loader materializes fp16 shards before quantizing, so 14B
-OOMs a $22$\,GB GPU at load; the 7B production configuration is the robust
-default, and the 14B headline stands from a run on the prior stack.
+OOMs a $22$\,GB GPU \emph{at load}; the 7B Fine-tuned RAG---which already wins
+the rubric comparison---is the reproducible default, and the 14B figures are a
+larger-GPU bonus (they stand from a clean-stack run, VRAM peak $14.5$\,GB; pin
+\texttt{requirements.txt} or use a $\geq\!40$\,GB GPU to reproduce).
 
 %==============================================================================
 \section{Conclusion}
 %==============================================================================
-We built a Turkish-legal RAG pipeline that improves a naive baseline by
-$+87.7\%$ Token~F1 and halves hallucination, and---through a triage-driven,
+We built a Turkish-legal RAG pipeline that, holding the generator fixed,
+improves a naive baseline by $+69.1\%$ Token~F1 (\,$+87.7\%$ with an optional
+14B generator\,) and halves hallucination, and---through a triage-driven,
 negative-result-forward methodology---showed \emph{which} adaptations actually
 pay off. The decisive gains came from off-the-shelf components, a rule-based
 post-processor, and model scale; our fine-tuned reranker and QLoRA generator
@@ -560,6 +721,14 @@ MT-Bench and Chatbot Arena,'' \emph{NeurIPS}, 2023.
 \bibitem{turknli2024} ``legal\_nli\_TR\_V1: Turkish Commercial Court NLI
 Dataset,'' HuggingFace Datasets, 2024.
 \bibitem{qwen2024} Qwen Team, ``Qwen2.5 Technical Report,'' 2024.
+\bibitem{bikmaz2025bridging} E.~B\i kmaz, M.~Briman, and S.~Arslan, ``Bridging
+the Language Gap in RAG: A Case Study on Turkish Retrieval and Generation,''
+\emph{Researcher}, 5(1), pp.~38--49, 2025.
+\bibitem{atagun2025rag} E.~Atag\"un, M.~G\"ull\"u, S.~Biro\u{g}ul, and
+N.~Bar\i\c{s}\c{c}\i, ``Retrieval-Augmented Generation in Turkish Natural
+Language Understanding: A Comparative Study of Large Language Models,''
+\emph{Mu\u{g}la J.\ Sci.\ Tech.}, 11(2), pp.~56--65, 2025,
+doi:~10.22531/muglajsci.1781095.
 \end{thebibliography}
 
 \end{document}
