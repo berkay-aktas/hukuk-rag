@@ -47,7 +47,7 @@ pip install -r requirements.txt
 python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/base/
 #    Fine-tuned RAG needs the fine-tuned E5 encoder (see "Fine-tuned checkpoint" below):
 python -m hukuk_rag ingest --docs ./your_corpus/ --out ./indexes/ft/ \
-  --embedding-model <hf-id-or-local-path-of-fine-tuned-e5>
+  --embedding-model bewrkay/multilingual-e5-large-tr-legal
 
 # 3. Base RAG vs. Fine-tuned RAG on the SAME benchmark and SAME LLM
 python -m hukuk_rag benchmark --questions ./your_questions.jsonl \
@@ -68,8 +68,9 @@ a ≥ 40 GB GPU for the scaling result). Add `--no-llm` for GPU-free, retrieval-
 
 > **Fine-tuned checkpoint.** `--variant base` reproduces out-of-the-box — the reranker and
 > generator download automatically. `--variant prod` (the recommended Fine-tuned RAG)
-> additionally requires the **fine-tuned E5 encoder**, which is distributed separately from
-> this repository; obtain it and pass its Hugging Face id or local path to `--embedding-model`.
+> additionally requires the **fine-tuned E5 encoder**, published at
+> [`bewrkay/multilingual-e5-large-tr-legal`](https://huggingface.co/bewrkay/multilingual-e5-large-tr-legal)
+> — it auto-downloads when passed to `--embedding-model` (no manual setup).
 
 ### Accepted inputs
 
