@@ -10,6 +10,9 @@ ablation and a focus on reproducible, statistically-tested results.
 
 📄 **[Read the paper → `reports/final_report.pdf`](reports/final_report.pdf)**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/berkay-aktas/hukuk-rag/blob/master/notebooks/evaluate_custom_corpus.ipynb)
+**Run it on your own data — no setup.** Open the Colab notebook, upload your documents (and, optionally, a benchmark), and get the Base-vs-Fine-tuned comparison plus a live demo link.
+
 ## Highlights
 
 Holding the generator fixed (Qwen-7B), the fine-tuned pipeline beats a naive baseline by a
@@ -175,7 +178,7 @@ cd hukuk-rag
 pip install -r requirements.txt
 ```
 
-Developed for **Google Colab (T4 GPU, 16 GB VRAM)**; all LLM operations use 4-bit
+Developed on **Google Colab (T4 16 GB and L4 24 GB GPUs)**; the 7B system fits a T4 and the optional 14B uses an L4, both via 4-bit
 quantization to fit the memory budget. Large artifacts (indexes, checkpoints) live outside the
 repository — the `ingest` CLI rebuilds indexes from any corpus. On CPU-only machines the
 ingest and `--no-llm` retrieval paths work (BM25 + `faiss-cpu`); generation requires a GPU.
