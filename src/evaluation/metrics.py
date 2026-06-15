@@ -339,7 +339,8 @@ def bertscore(
 # Faithfulness and citation metrics
 # ---------------------------------------------------------------------------
 
-_CITATION_PATTERN = re.compile(r'\[(\d+)\]')
+# Matches both bare [N] and the [Kaynak N] source markers the prompt actually uses.
+_CITATION_PATTERN = re.compile(r'\[(?:Kaynak\s*)?(\d+)\]')
 
 
 def faithfulness_score(
@@ -379,7 +380,7 @@ def citation_accuracy(
 ) -> dict[str, float]:
     """Compute citation usage statistics in generated answers.
 
-    Checks how answers use [1], [2], etc. citation markers.
+    Checks how answers use ``[Kaynak N]`` / ``[N]`` citation markers.
 
     Args:
         predictions: List of generated answers.
